@@ -1773,6 +1773,33 @@ static int _add_libs_callback(str lib, void* userData, int line, const char* fil
 		_check(_parse_list(library_list, _add_libs_callback, &_target->linkOpt._flags, __LINE__, __FILE__)); \
 	} while((void)0,0)
 
+static int _add_lib_paths_callback(str libPath, void* userData, int line, const char* file) {
+	_cmdlinebuffer* cmdLine = (_cmdlinebuffer*)userData;
+	(void)line;
+	(void)file;
+
+#if COMPILER == COMPILER_MSVC
+	_check(_cmdline_add_arg(_s("/LIBPATH:"), cmdLine));
+#else
+	_check(_cmdline_add_arg(_s("-L"), cmdLine));
+#endif
+
+	_check(_cmdline_append_arg(libPath, cmdLine));
+
+	return 0;
+}
+
+#define library_paths(path_list) \
+	_check(_parse_list(path_list, _add_lib_paths_callback, &_g_linkOptions._flags, __LINE__, __FILE__))
+
+#define target_library_paths(target_or_target_name, path_list) \
+	do { \
+		Target _target = _get_target(target_or_target_name, __LINE__, __FILE__); \
+		if(_target == NONE) \
+			return 1; \
+		_check(_parse_list(path_list, _add_lib_paths_callback, &_target->linkOpt._flags, __LINE__, __FILE__)); \
+	} while((void)0,0)
+
 /*
  * Process creation
  */
