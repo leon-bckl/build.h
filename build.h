@@ -288,7 +288,14 @@ static char   _g_win32ArgvBuffer[512];
 static int    _g_win32CwdLen = 0;
 static _wchar _g_win32Cwd[MAX_PATH];
 static void*  _g_win32Processes[MAX_JOBS + 1]; /* +1 so the last entry is always NONE */
-static int    _g_win32ProcessCount = 0;
+
+typedef struct {
+	void* stdoutRead;
+	void* stdoutWrite;
+} _win32processoutput;
+
+static _win32processoutput  _g_win32ProcessOutput[MAX_JOBS + 1]; /* +1 so the last entry is always NONE */
+static int                  _g_win32ProcessCount = 0;
 #endif
 
 /*
@@ -475,17 +482,26 @@ typedef enum{
 	GetFileExMaxInfoLevel
 } GET_FILEEX_INFO_LEVELS;
 
-typedef struct SECURITY_ATTRIBUTES SECURITY_ATTRIBUTES;
+typedef struct {
+	_ulong nLength;
+	void*  lpSecurityDescriptor;
+	int    bInheritHandle;
+} SECURITY_ATTRIBUTES;
+
+typedef struct OVERLAPPED OVERLAPPED;
 
 _import _ulong _winapi GetLastError(void);
 
 _import void _winapi GetSystemInfo(SYSTEM_INFO* lpSystemInfo);
 
 _import int _winapi CloseHandle(void* hObject);
+_import int _winapi SetHandleInformation(void* hObject, _ulong dwMask, _ulong dwFlags);
 
 _import int _winapi CreateProcessW(const _wchar* lpApplicationName, _wchar* lpCommandLine, void* lpProcessAttributes, void* lpThreadAttributes, int bInheritHandles, _ulong dwCreationFlags, void* lpEnvironment, const _wchar* lpCurrentDirectory, STARTUPINFOW* lpStartupInfo, PROCESS_INFORMATION* lpProcessInformation);
 _import _noreturn void _winapi ExitProcess (_uint uExitCode);
 _import int _winapi GetExitCodeProcess(void* hProcess, _ulong* lpExitCode);
+
+_import int _winapi CreatePipe(void** hReadPipe, void** hWritePipe, SECURITY_ATTRIBUTES* lpPipeAttributes, _ulong nSize);
 
 _import void* _winapi LoadLibraryW(const _wchar* lpLibFileName);
 typedef void(_winapi*_farproc)(void);
@@ -498,6 +514,8 @@ _import _ulong _winapi GetCurrentDirectoryW(_ulong nBufferLength, _wchar* lpBuff
 
 _import _ulong _winapi GetFileAttributesW(const _wchar* lpFileName);
 _import int _winapi GetFileAttributesExW(const _wchar* lpFileName, GET_FILEEX_INFO_LEVELS fInfoLevelId, void* lpFileInformation);
+
+_import int _winapi ReadFile(void* hFile, void* lpBuffer, _ulong nNumberOfBytesToRead, _ulong* lpNumberOfBytesRead, OVERLAPPED* lpOverlapped);
 _import int _winapi WriteFile(void* hFile, const void* lpBuffer, _ulong nNumberOfBytesToWrite, _ulong* lpNumberOfBytesWritten, void* lpOverlapped);
 
 _import int _winapi CreateDirectoryW(const _wchar* lpPathName, SECURITY_ATTRIBUTES* lpSecurityAttributes);
@@ -1935,6 +1953,20 @@ static int _add_lib_paths_callback(str libPath, void* userData, int line, const 
  * Process creation
  */
 
+static void _log_job_output(int jobIdx) {
+#if OS == OS_WINDOWS
+	char   buffer[512];
+	_ulong bytesRead = 0;
+
+	_log_err(_emptyString, -1, NONE);
+
+	do {
+		ReadFile(_g_win32ProcessOutput[jobIdx].stdoutRead, buffer, sizeof(buffer), &bytesRead, NONE);
+		_log_raw(_str(buffer, (int)bytesRead));
+	} while(bytesRead == sizeof(buffer));
+#endif
+}
+
 static int _wait_jobs(void) {
 	int exitCode = 0;
 	int i;
@@ -1949,14 +1981,17 @@ static int _wait_jobs(void) {
 			_ulong procExit = 0;
 			GetExitCodeProcess(hProcess, &procExit);
 
-			if(procExit != 0)
-				exitCode = procExit;
+			if(procExit != 0) {
+				exitCode = (int)procExit;
+				_log_job_output(i);
+			}
 		}
 
 		CloseHandle(hProcess);
 	}
 
 	mem_fill(_g_win32Processes, 0, sizeof(_g_win32Processes));
+	mem_fill(_g_win32ProcessOutput, 0, sizeof(_g_win32ProcessOutput));
 	_g_win32ProcessCount = 0;
 
 	return exitCode;
@@ -1966,39 +2001,64 @@ static int _add_job(_cmdlinebuffer cmdLine, str workingDir) {
 #if OS == OS_WINDOWS
 	_wchar              workingDirBuffer[MAX_PATH];
 	_wchar              cmdLineBuffer[MAX_COMMAND_LINE + 1];
-	const int           workingDirLen = MultiByteToWideChar(CP_UTF8, 0, workingDir.data, workingDir.len, workingDirBuffer, MAX_PATH);
-	const int           cmdLineLen    = MultiByteToWideChar(CP_UTF8, 0, cmdLine.buffer, cmdLine.len, cmdLineBuffer, MAX_COMMAND_LINE + 1);
-	STARTUPINFOW        startupInfo   = {0};
-	PROCESS_INFORMATION processInfo   = {0};
+	const int           workingDirLen      = MultiByteToWideChar(CP_UTF8, 0, workingDir.data, workingDir.len, workingDirBuffer, MAX_PATH);
+	const int           cmdLineLen         = MultiByteToWideChar(CP_UTF8, 0, cmdLine.buffer, cmdLine.len, cmdLineBuffer, MAX_COMMAND_LINE + 1);
+	STARTUPINFOW        startupInfo        = {0};
+	PROCESS_INFORMATION processInfo        = {0};
+	SECURITY_ATTRIBUTES securityAttributes = {0};
+	void*               stdoutRead;
+	void*               stdoutWrite;
 
-	workingDirBuffer[workingDirLen] = '\0';
-	cmdLineBuffer[cmdLineLen]       = '\0';
-
-	startupInfo.cb         = sizeof(startupInfo);
-	startupInfo.dwFlags    = 0x00000100; /* STARTF_USESTDHANDLES */
-	/* Redirect all output to stdout */
-	startupInfo.hStdError  = _g_win32StdoutHandle;
-	startupInfo.hStdOutput = _g_win32StdoutHandle;
 
 	/* Max job slots used, wait for one to finish */
 	if(_g_win32ProcessCount >= _g_maxJobs) {
-		_ulong exitCode = 0;
-		_ulong wait     = WaitForMultipleObjects((_ulong)_g_win32ProcessCount, _g_win32Processes, 0, INFINITE);
+		_ulong       exitCode = 0;
+		const _ulong wait     = WaitForMultipleObjects((_ulong)_g_win32ProcessCount, _g_win32Processes, 0, INFINITE);
 
 		if(wait == WAIT_FAILED)
 			return (int)GetLastError();
 
 		GetExitCodeProcess(_g_win32Processes[wait], &exitCode);
+
+		if(exitCode != 0)
+			_log_job_output((int)wait);
+
 		CloseHandle(_g_win32Processes[wait]);
-		_g_win32Processes[wait] = _g_win32Processes[_g_win32ProcessCount - 1];
-		_g_win32Processes[_g_win32ProcessCount - 1] = NONE;
+		CloseHandle(_g_win32ProcessOutput[wait].stdoutRead);
+		CloseHandle(_g_win32ProcessOutput[wait].stdoutWrite);
 		--_g_win32ProcessCount;
+		_g_win32Processes[wait]                                 = _g_win32Processes[_g_win32ProcessCount];
+		_g_win32ProcessOutput[wait]                             = _g_win32ProcessOutput[_g_win32ProcessCount];
+		_g_win32Processes[_g_win32ProcessCount]                 = NONE;
+		_g_win32ProcessOutput[_g_win32ProcessCount].stdoutRead  = NONE;
+		_g_win32ProcessOutput[_g_win32ProcessCount].stdoutWrite = NONE;
 
 		if(exitCode != 0)
 			return (int)exitCode;
 	}
 
+	securityAttributes.nLength        = sizeof(SECURITY_ATTRIBUTES);
+	securityAttributes.bInheritHandle = 1;
+
+	if(!CreatePipe(&stdoutRead, &stdoutWrite, &securityAttributes, 0)) {
+		_log_err(_s("Failed to create stdout pipe"), -1, NONE);
+		return (int)GetLastError();
+	}
+
+	workingDirBuffer[workingDirLen] = '\0';
+	cmdLineBuffer[cmdLineLen]       = '\0';
+
+	SetHandleInformation(stdoutRead, 1, 0); /* HANDLE_FLAG_INHERIT set to 0 */
+
+	startupInfo.cb         = sizeof(startupInfo);
+	startupInfo.dwFlags    = 0x00000100; /* STARTF_USESTDHANDLES */
+	/* Redirect all output to stdout */
+	startupInfo.hStdError  = stdoutWrite;
+	startupInfo.hStdOutput = stdoutWrite;
+
 	if(!CreateProcessW(NONE, cmdLineBuffer, NONE, NONE, 1, 0, NONE, workingDirLen > 0 ? workingDirBuffer : _g_win32Cwd, &startupInfo, &processInfo)) {
+		CloseHandle(stdoutRead);
+		CloseHandle(stdoutWrite);
 		_log_err(_s("Failed to start process '"), -1, NONE);
 		_log_raw(_str(cmdLine.buffer, cmdLine.len));
 		_log_raw(_s("'"));
@@ -2006,7 +2066,10 @@ static int _add_job(_cmdlinebuffer cmdLine, str workingDir) {
 	}
 
 	CloseHandle(processInfo.hThread);
-	_g_win32Processes[_g_win32ProcessCount++] = processInfo.hProcess;
+	_g_win32Processes[_g_win32ProcessCount]                 = processInfo.hProcess;
+	_g_win32ProcessOutput[_g_win32ProcessCount].stdoutRead  = stdoutRead;
+	_g_win32ProcessOutput[_g_win32ProcessCount].stdoutWrite = stdoutWrite;
+	++_g_win32ProcessCount;
 #endif
 
 	return 0;
@@ -2019,18 +2082,10 @@ static int _add_compile_job(_source* source, str buildDir) {
 	if(_g_verbose)
 		_log_cmdline(&cmdLine);
 
-	/*
-	 * msvc always prints the file name.
-	 * This can't be turned off so we just don't print the file and target name.
-	 * In the future process output might be filtered and not just written to stdout.
-	 */
-#if COMPILER != COMPILER_MSVC
 	_log_msg(_s("["), -1, NONE);
 	_log_raw(_cstr(source->target->name));
 	_log_raw(_s("] "));
-	_log_raw(source->target->projectDir);
-	_log_raw(source->fileName);
-#endif
+	_log_raw(_file_without_path(source->fileName));
 
 	return _add_job(cmdLine, source->target->projectDir);
 }
