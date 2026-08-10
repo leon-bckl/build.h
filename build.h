@@ -153,7 +153,7 @@ typedef enum {
 	Profiling
 } _buildconfig;
 
-typedef struct{
+typedef struct {
 #if OS != OS_WINDOWS
 	int   argc;
 	char* argv[MAX_ARGS + 1];
@@ -162,7 +162,12 @@ typedef struct{
 	char  buffer[MAX_COMMAND_LINE];
 } _cmdlinebuffer;
 
-typedef enum{
+typedef struct {
+	_ulong lo;
+	_ulong hi;
+} _filetime;
+
+typedef enum {
 	CDefault,
 	C89,
 	C99,
@@ -170,7 +175,7 @@ typedef enum{
 	C23
 } _clanguageversion;
 
-typedef enum{
+typedef enum {
 	CppDefault,
 	Cpp03,
 	Cpp11,
@@ -181,20 +186,20 @@ typedef enum{
 	Cpp26
 } _cpplanguageversion;
 
-typedef enum{
+typedef enum {
 	OptimizeDefault,
 	OptimizeNone,
 	OptimizeSpeed,
 	OptimizeSize
 } _optimizationlevel;
 
-typedef enum{
+typedef enum {
 	NotSet,
 	Disabled,
 	Enabled
 } _tristate;
 
-typedef struct{
+typedef struct {
 	_clanguageversion   cVersion;
 	_cpplanguageversion cppVersion;
 	_optimizationlevel  optimizations;
@@ -204,7 +209,7 @@ typedef struct{
 	_cmdlinebuffer      _cppFlags;
 } _compileoptions;
 
-typedef struct{
+typedef struct {
 	_cmdlinebuffer _flags;
 } _linkoptions;
 
@@ -214,24 +219,24 @@ typedef enum _target_type {
 	Executable,
 	StaticLibrary,
 	SharedLibrary
-} _target_type;
+} _artifact_type;
 
 typedef struct _target* Target;
 
 struct _target {
 	const char*     name;
 	str             projectDir;
-	_target_type    type;
+	_artifact_type    type;
 	_compileoptions compileOpt;
 	_linkoptions    linkOpt;
+	_filetime       _lastModified;
 	_bool           _skipBuild;
 	_bool           _isLinkTarget;
-	int             _sourceCount;
 	int             _linkDependencyCount;
 	Target          _linkDependencies[MAX_TARGET_DEPENDENCIES];
 };
 
-typedef enum{
+typedef enum {
 	CSrc,
 	CppSrc,
 	RcSrc
@@ -242,6 +247,7 @@ typedef struct {
 	str         fileName;
 	_sourcekind kind;
 	int         compiled;
+	_filetime   lastModified;
 } _source;
 
 typedef struct {
@@ -259,8 +265,9 @@ static const str       _emptyString = {0};
 
 static str             _g_buildDir;
 static str             _g_currentProjectDir;
-static _bool           _g_verbose = false;
-static int             _g_maxJobs = 1;
+static _bool           _g_verbose     = false;
+static _bool           _g_incremental = false;
+static int             _g_maxJobs     = 1;
 
 static char            _g_cwdBuffer[MAX_PATH];
 static str             _g_cwd;
@@ -303,11 +310,12 @@ static int                  _g_win32ProcessCount = 0;
  */
 
 #if COMPILER == COMPILER_MSVC
-	#pragma warning(push)
 	#pragma warning(disable: 4210) /* nonstandard extension used : function given file scope */
+	#pragma warning(push)
 #elif COMPILER == COMPILER_GCC || COMPILER == COMPILER_CLANG
 	#pragma GCC diagnostic push
 	#pragma GCC diagnostic ignored "-Wcast-function-type" /* GetProcAddress return value */
+	#pragma GCC diagnostic ignored "-Wunused-function"
 #endif
 
 /*
@@ -438,7 +446,7 @@ typedef struct {
 	void*         hStdError;
 } STARTUPINFOW;
 
-typedef struct{
+typedef struct {
 	union {
 		_ulong dwOemId;
 		struct {
@@ -457,12 +465,12 @@ typedef struct{
 	_ushort wProcessorRevision;
 } SYSTEM_INFO;
 
-typedef struct{
+typedef struct {
 	_ulong dwLowDateTime;
 	_ulong dwHighDateTime;
 } FILETIME;
 
-typedef struct{
+typedef struct {
 	_ulong   dwFileAttributes;
 	FILETIME ftCreationTime;
 	FILETIME ftLastAccessTime;
@@ -477,7 +485,7 @@ typedef struct{
 #define FILE_ATTRIBUTE_DIRECTORY 0x00000010
 #define FILE_ATTRIBUTE_NORMAL    0x00000080
 
-typedef enum{
+typedef enum {
 	GetFileExInfoStandard,
 	GetFileExMaxInfoLevel
 } GET_FILEEX_INFO_LEVELS;
@@ -1060,10 +1068,38 @@ static Target _get_target(const void* targetOrTargetName, int line, const char* 
 	return target;
 }
 
+static void _get_lastmodified(str filePath, _filetime* fileTime) {
+	_wchar                    path[MAX_PATH];
+	WIN32_FILE_ATTRIBUTE_DATA attributes = {0};
+	fileTime->hi = 0;
+	fileTime->lo = 0;
+
+	_win32_assemble_path(filePath, path);
+
+	if(GetFileAttributesExW(path, GetFileExInfoStandard, &attributes)) {
+		fileTime->hi = attributes.ftLastWriteTime.dwHighDateTime;
+		fileTime->lo = attributes.ftLastWriteTime.dwLowDateTime;
+	}
+}
+
+static int _assemble_source_path(const _source* source, _pathbuffer* pathBuffer) {
+	if(!_path_is_abs(source->fileName)) {
+		if(!_path_is_abs(source->target->projectDir))
+			_check(_path_add_segment(_g_cwd, pathBuffer));
+
+		_check(_path_add_segment(source->target->projectDir, pathBuffer));
+	}
+
+	_check(_path_append_raw(source->fileName, pathBuffer));
+
+	return 0;
+}
+
 static int _target_source_callback(str fileName, void* userData, int line, const char* file) {
-	Target    target  = (Target)userData;
-	const str fileExt = _file_ext(fileName);
-	_source*  source;
+	_pathbuffer pathBuffer;
+	Target      target  = (Target)userData;
+	const str   fileExt = _file_ext(fileName);
+	_source*    source;
 
 	if(_g_sourceCount >= MAX_SOURCES) {
 		_log_err(_s("Too many sources, define MAX_SOURCES to increase limit (" _stringify(MAX_SOURCES) ")"), line, file);
@@ -1101,8 +1137,11 @@ static int _target_source_callback(str fileName, void* userData, int line, const
 	source->target   = target;
 	source->fileName = fileName;
 
+	pathBuffer.len = 0;
+	_check(_assemble_source_path(source, &pathBuffer));
+	_get_lastmodified(_str(pathBuffer.data, pathBuffer.len), &source->lastModified);
+
 	++_g_sourceCount;
-	++target->_sourceCount;
 
 	return 0;
 }
@@ -1117,43 +1156,6 @@ static int _target_sources(const void* targetOrTargetName, const char* sources, 
 }
 
 #define target_sources(target_or_target_name, source_list) _target_sources(target_or_target_name, source_list, __LINE__, __FILE__)
-
-static int _add_target(const char* name, _target_type type, const char* sources, int line, const char* file) {
-	Target       target;
-
-	if(_g_targetCount >= MAX_TARGETS) {
-		_log_err(_s("Too many targets, define MAX_TARGETS to increase limit (" _stringify(MAX_TARGETS) ")"), line, file); \
-		 return 1;
-	}
-
-	target = find_target(name);
-
-	if(target != NONE) {
-		_log_err(_s("Target name must be unique"), line, file); \
-		 return 1;
-	}
-
-	target             = &_g_targets[_g_targetCount++];
-	target->name       = name;
-	target->projectDir = _g_currentProjectDir;
-	target->type       = type;
-
-	target_sources(target, sources);
-
-	return 0;
-}
-
-static Target _nextTarget(void){
-	return _g_nextTarget++;
-}
-
-#define add_target(target_name, target_type, source_list) \
-	_nextTarget(); \
-	_check(_add_target(target_name, target_type, source_list, __LINE__, __FILE__))
-
-#define add_executable(executable_name, source_list)  add_target(executable_name, Executable, source_list)
-#define add_static_library(library_name, source_list) add_target(library_name, StaticLibrary, source_list)
-#define add_shared_library(library_name, source_list) add_target(library_name, SharedLibrary, source_list)
 
 /*
  * Target output files
@@ -1177,7 +1179,7 @@ static str _rel_build_path(str path) {
 	return path;
 }
 
-static str _target_file_ext(_target_type targetType) {
+static str _target_file_ext(_artifact_type targetType) {
 	switch(targetType) {
 	case ObjectFile:
 #if COMPILER == COMPILER_MSVC
@@ -1216,11 +1218,12 @@ static str _target_file_ext(_target_type targetType) {
 	}
 }
 
-static int _make_target_filepath(str baseName, str buildDir, _target_type targetType, _pathbuffer* buffer) {
-	if(!_path_is_abs(buildDir))
+static int _make_artifact_filepath(str baseName, str projectDir, _artifact_type targetType, _pathbuffer* buffer) {
+	if(!_path_is_abs(_g_buildDir))
 		_check(_path_add_segment(_g_cwd, buffer));
 
-	_check(_path_add_segment(buildDir, buffer));
+	_check(_path_add_segment(_g_buildDir, buffer));
+	_check(_path_add_segment(_rel_build_path(projectDir), buffer));
 	_check(_path_add_segment(_rel_build_path(baseName), buffer));
 
 	/*
@@ -1236,6 +1239,48 @@ static int _make_target_filepath(str baseName, str buildDir, _target_type target
 
 	return 0;
 }
+
+static int _add_target(const char* name, _artifact_type type, const char* sources, int line, const char* file) {
+	_pathbuffer pathBuffer;
+	Target      target;
+
+	if(_g_targetCount >= MAX_TARGETS) {
+		_log_err(_s("Too many targets, define MAX_TARGETS to increase limit (" _stringify(MAX_TARGETS) ")"), line, file); \
+		 return 1;
+	}
+
+	target = find_target(name);
+
+	if(target != NONE) {
+		_log_err(_s("Target name must be unique"), line, file); \
+		 return 1;
+	}
+
+	target             = &_g_targets[_g_targetCount++];
+	target->name       = name;
+	target->projectDir = _g_currentProjectDir;
+	target->type       = type;
+
+	pathBuffer.len = 0;
+	_check(_make_artifact_filepath(_cstr(target->name), target->projectDir, target->type, &pathBuffer));
+	_get_lastmodified(_str(pathBuffer.data, pathBuffer.len), &target->_lastModified);
+
+	target_sources(target, sources);
+
+	return 0;
+}
+
+static Target _nextTarget(void){
+	return _g_nextTarget++;
+}
+
+#define add_target(target_name, target_type, source_list) \
+	_nextTarget(); \
+	_check(_add_target(target_name, target_type, source_list, __LINE__, __FILE__))
+
+#define add_executable(executable_name, source_list)  add_target(executable_name, Executable, source_list)
+#define add_static_library(library_name, source_list) add_target(library_name, StaticLibrary, source_list)
+#define add_shared_library(library_name, source_list) add_target(library_name, SharedLibrary, source_list)
 
 /*
  * Executable names
@@ -1280,7 +1325,7 @@ static str _compiler_executable(_sourcekind sourceKind) {
 	}
 }
 
-static str _linker_executable(_target_type targetType) {
+static str _linker_executable(_artifact_type targetType) {
 	(void)targetType;
 #if COMPILER == COMPILER_MSVC
 	if(targetType == StaticLibrary)
@@ -1430,7 +1475,7 @@ static int _cmdline_combine(_cmdlinebuffer* cmdLine, const _cmdlinebuffer* other
 	return 0;
 }
 
-static int _cmdline_add_compile_options(const _source* source, str buildDir, const _compileoptions* defaults, const _compileoptions* overrides, _cmdlinebuffer* cmdLine) {
+static int _cmdline_add_compile_options(const _source* source, const _compileoptions* defaults, const _compileoptions* overrides, _cmdlinebuffer* cmdLine) {
 	const _clanguageversion   cVersion      = overrides->cVersion != CDefault ? overrides->cVersion : defaults->cVersion;
 	const _cpplanguageversion cppVersion    = overrides->cppVersion != CppDefault ? overrides->cppVersion : defaults->cppVersion;
 	const _optimizationlevel  optimizations = overrides->optimizations != OptimizeDefault ? overrides->optimizations : defaults->optimizations;
@@ -1516,11 +1561,10 @@ static int _cmdline_add_compile_options(const _source* source, str buildDir, con
 			_check(_cmdline_add_arg(_s("/Zi"), cmdLine));
 			_check(_cmdline_add_arg(_s("/Fd"), cmdLine));
 			pathBuffer.len = 0;
-			_check(_make_target_filepath(source->fileName, buildDir, DebugInformation, &pathBuffer));
+			_check(_make_artifact_filepath(source->fileName, source->target->projectDir, DebugInformation, &pathBuffer));
 			_check(_cmdline_append_arg(_str(pathBuffer.data, pathBuffer.len), cmdLine));
 		}
 #else
-		(void)buildDir;
 		_check(_cmdline_add_arg(_s("-g"), cmdLine));
 #endif
 	}
@@ -1536,7 +1580,7 @@ static int _cmdline_add_compile_options(const _source* source, str buildDir, con
 	return 0;
 }
 
-static int _build_compiler_cmdline(const _source* source, str buildDir, _cmdlinebuffer* cmdLine) {
+static int _build_compiler_cmdline(const _source* source, _cmdlinebuffer* cmdLine) {
 	_pathbuffer pathBuffer;
 	const str   compiler = _compiler_executable(source->kind);
 
@@ -1566,26 +1610,26 @@ static int _build_compiler_cmdline(const _source* source, str buildDir, _cmdline
 	}
 
 	if(source->kind != RcSrc) /* TODO: Separate include paths and defines and pass them to rc */
-		_check(_cmdline_add_compile_options(source, buildDir, &_g_compileOptions, &source->target->compileOpt, cmdLine));
+		_check(_cmdline_add_compile_options(source, &_g_compileOptions, &source->target->compileOpt, cmdLine));
 
-	if(COMPILER == COMPILER_MSVC || (COMPILER == COMPILER_CLANG && source->kind == RcSrc))
-		_check(_cmdline_add_arg(_s("/Fo"), cmdLine));
+#if COMPILER == COMPILER_MSVC
+	_check(_cmdline_add_arg(_s("/Fo"), cmdLine));
+#else
+	#if COMPILER == COMPILER_CLANG
+	if(source->kind == RcSrc)
+		_check(_cmdline_add_arg(_s("/Fo"), cmdLine)); /* llvm-rc uses /Fo like msvc rc */
 	else
-		_check(_cmdline_add_arg(_s("-o"), cmdLine));
+	#endif
+	_check(_cmdline_add_arg(_s("-o"), cmdLine));
+#endif
 
 	pathBuffer.len = 0;
-	_check(_make_target_filepath(source->fileName, buildDir, ObjectFile, &pathBuffer));
+	_check(_make_artifact_filepath(source->fileName, source->target->projectDir, ObjectFile, &pathBuffer));
 	_check(_cmdline_append_arg(_str(pathBuffer.data, pathBuffer.len), cmdLine));
 
 	pathBuffer.len = 0;
-
-	if(!_path_is_abs(source->target->projectDir))
-		_check(_path_add_segment(_g_cwd, &pathBuffer));
-
-	_check(_path_add_segment(source->target->projectDir, &pathBuffer));
-	_check(_path_append_raw(source->fileName, &pathBuffer));
+	_check(_assemble_source_path(source, &pathBuffer));
 	_check(_cmdline_add_arg(_str(pathBuffer.data, pathBuffer.len), cmdLine));
-
 	return 0;
 }
 
@@ -1596,7 +1640,7 @@ static int _cmdline_add_link_options(const _linkoptions* defaults, const _linkop
 	return 0;
 }
 
-static int _build_linker_cmdline(Target target, str buildDir, _cmdlinebuffer* cmdLine) {
+static int _build_linker_cmdline(Target target, _cmdlinebuffer* cmdLine) {
 	_pathbuffer pathBuffer;
 	str         linker = _linker_executable(target->type);
 	int         i;
@@ -1640,7 +1684,7 @@ static int _build_linker_cmdline(Target target, str buildDir, _cmdlinebuffer* cm
 			_check(_cmdline_add_arg(_s("/PDB:"), cmdLine));
 
 			pathBuffer.len = 0;
-			_check(_make_target_filepath(_file_basename(_cstr(target->name)), buildDir, DebugInformation, &pathBuffer));
+			_check(_make_artifact_filepath(_file_basename(_cstr(target->name)), target->projectDir, DebugInformation, &pathBuffer));
 			_check(_cmdline_append_arg(_str(pathBuffer.data, pathBuffer.len), cmdLine));
 		}
 #endif
@@ -1653,7 +1697,7 @@ static int _build_linker_cmdline(Target target, str buildDir, _cmdlinebuffer* cm
 #endif
 
 	pathBuffer.len = 0;
-	_check(_make_target_filepath(_cstr(target->name), buildDir, target->type, &pathBuffer));
+	_check(_make_artifact_filepath(_cstr(target->name), target->projectDir, target->type, &pathBuffer));
 	_check(_cmdline_append_arg(_str(pathBuffer.data, pathBuffer.len), cmdLine));
 
 	for(i = 0; i < _g_sourceCount; ++i) {
@@ -1663,7 +1707,7 @@ static int _build_linker_cmdline(Target target, str buildDir, _cmdlinebuffer* cm
 			continue;
 
 		pathBuffer.len = 0;
-		_check(_make_target_filepath(source->fileName, buildDir, ObjectFile, &pathBuffer));
+		_check(_make_artifact_filepath(source->fileName, target->projectDir, ObjectFile, &pathBuffer));
 		_check(_cmdline_add_arg(_str(pathBuffer.data, pathBuffer.len), cmdLine));
 	}
 
@@ -1806,23 +1850,25 @@ static int _target_lib_path(str libPath, _cmdlinebuffer* cmdLine) {
 #else
 		_check(_cmdline_add_arg(_s("-L"), cmdLine));
 #endif
-	}
 
-	_check(_cmdline_append_arg(libPath, cmdLine));
+		_check(_cmdline_append_arg(libPath, cmdLine));
+	}
 
 	return 0;
 }
 
 static int _target_link_lib(str libName, _cmdlinebuffer* cmdLine) {
+	if(libName.len > 0) {
 #if COMPILER == COMPILER_MSVC
-	_check(_cmdline_add_arg(libName, cmdLine));
+		_check(_cmdline_add_arg(libName, cmdLine));
 
-	if(_file_ext(libName).len == 0)
-		_check(_cmdline_append_arg(_s(".lib"), cmdLine));
+		if(_file_ext(libName).len == 0)
+			_check(_cmdline_append_arg(_s(".lib"), cmdLine));
 #else
-	_check(_cmdline_add_arg(_s("-l"), cmdLine));
-	_check(_cmdline_append_arg(libName, cmdLine));
+		_check(_cmdline_add_arg(_s("-l"), cmdLine));
+		_check(_cmdline_append_arg(libName, cmdLine));
 #endif
+	}
 
 	return 0;
 }
@@ -1858,7 +1904,6 @@ static _bool _target_depends_on(Target target, Target dependency) {
 }
 
 static int _target_link(Target target, Target linkedTarget, int line, const char* file) {
-	_pathbuffer targetBuildDirBuffer;
 	_pathbuffer targetLibDirBuffer;
 	int         i;
 
@@ -1883,12 +1928,8 @@ static int _target_link(Target target, Target linkedTarget, int line, const char
 	target->_linkDependencies[target->_linkDependencyCount++] = linkedTarget;
 	linkedTarget->_isLinkTarget = true;
 
-	targetBuildDirBuffer.len = 0;
-	_check(_path_add_segment(_g_buildDir, &targetBuildDirBuffer));
-	_check(_path_add_segment(_rel_build_path(linkedTarget->projectDir), &targetBuildDirBuffer));
-
 	targetLibDirBuffer.len = 0;
-	_check(_make_target_filepath(_cstr(linkedTarget->name), _str(targetBuildDirBuffer.data, targetBuildDirBuffer.len), linkedTarget->type, &targetLibDirBuffer));
+	_check(_make_artifact_filepath(_cstr(linkedTarget->name), target->projectDir, target->type, &targetLibDirBuffer));
 
 	_check(_target_lib_path(_path_without_file(_str(targetLibDirBuffer.data, targetLibDirBuffer.len)), &target->linkOpt._flags));
 	_check(_target_link_lib(_cstr(linkedTarget->name), &target->linkOpt._flags));
@@ -2075,9 +2116,26 @@ static int _add_job(_cmdlinebuffer cmdLine, str workingDir) {
 	return 0;
 }
 
-static int _add_compile_job(_source* source, str buildDir) {
+static _bool _filetime_is_newer(_filetime f1, _filetime f2) {
+	if(f1.hi > f2.hi)
+		return true;
+
+	if(f1.hi == f2.hi)
+		return f1.lo > f2.lo;
+
+	return false;
+}
+
+static int _add_compile_job(_source* source, str objFilePath) {
 	_cmdlinebuffer cmdLine;
-	_check(_build_compiler_cmdline(source, buildDir, &cmdLine));
+	_filetime      objLastModified;
+
+	_get_lastmodified(objFilePath, &objLastModified);
+
+	if(_g_incremental && _filetime_is_newer(objLastModified, source->lastModified))
+		return 0;
+
+	_check(_build_compiler_cmdline(source, &cmdLine));
 
 	if(_g_verbose)
 		_log_cmdline(&cmdLine);
@@ -2090,10 +2148,10 @@ static int _add_compile_job(_source* source, str buildDir) {
 	return _add_job(cmdLine, source->target->projectDir);
 }
 
-static int _add_link_job(Target target, str outPath) {
+static int _add_link_job(Target target) {
 	_cmdlinebuffer cmdLine;
 
-	_check(_build_linker_cmdline(target, outPath, &cmdLine));
+	_check(_build_linker_cmdline(target, &cmdLine));
 
 	if(_g_verbose)
 		_log_cmdline(&cmdLine);
@@ -2136,7 +2194,6 @@ static void _sort_targets_by_link_order(Target* targets, int count) {
 
 static int _build(void) {
 	_pathbuffer pathBuffer = {0};
-	str         buildDirBase;
 	int         exitCode = 0;
 	int         i;
 
@@ -2167,26 +2224,20 @@ static int _build(void) {
 		}
 	}
 
-	_check(_path_add_segment(_g_buildDir, &pathBuffer));
-
-	buildDirBase = _str(pathBuffer.data, pathBuffer.len);
-
 	for(i = 0; i < _g_sourceCount; ++i) {
-		_source* source = &_g_sources[i];
-		str   projectBuildDir;
+		_source*  source = &_g_sources[i];
+		str       objFilePath;
 
 		if(source->compiled || source->target->_skipBuild)
 			continue;
 
-		--source->target->_sourceCount;
+		pathBuffer.len = 0;
+		_check(_make_artifact_filepath(source->fileName, source->target->projectDir, ObjectFile, &pathBuffer));
+		objFilePath = _str(pathBuffer.data, pathBuffer.len);
 
-		_check(_path_add_segment(_rel_build_path(source->target->projectDir), &pathBuffer));
-		projectBuildDir = _str(pathBuffer.data, pathBuffer.len);
-		_check(_path_append_raw(_rel_build_path(source->fileName), &pathBuffer));
-		_check(_create_directory(_str(pathBuffer.data, pathBuffer.len), -1, NONE));
+		_check(_create_directory(_path_without_file(objFilePath), -1, NONE));
 
-		exitCode       = _add_compile_job(source, projectBuildDir);
-		pathBuffer.len = buildDirBase.len;
+		exitCode = _add_compile_job(source, objFilePath);
 
 		if(exitCode != 0) {
 			_wait_jobs();
@@ -2216,11 +2267,7 @@ static int _build(void) {
 			if(target->_skipBuild)
 				continue;
 
-			pathBuffer.len = buildDirBase.len;
-			_check(_path_add_segment(_rel_build_path(target->projectDir), &pathBuffer));
-
-			exitCode       = _add_link_job(target, _str(pathBuffer.data, pathBuffer.len));
-			pathBuffer.len = buildDirBase.len;
+			exitCode = _add_link_job(target);
 
 			if(exitCode != 0) {
 				_wait_jobs();
@@ -2255,7 +2302,7 @@ static int _build(void) {
 #define add_project(project_identifier) \
 	do { \
 		int project_identifier ## _main(void); \
-		project_identifier ## _main(); \
+		_check(project_identifier ## _main()); \
 	} while((void)0,0)
 
 /*
@@ -2385,6 +2432,9 @@ static int _parse_args(int argc, char** argv) {
 						break;
 					} else if(_str_ieq(argStr, _s("--profiling"))) {
 						buildConfiguration = Profiling;
+						break;
+					} else if(_str_ieq(argStr, _s("--incremental"))) {
+						_g_incremental = true;
 						break;
 					}
 				}
