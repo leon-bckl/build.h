@@ -1052,9 +1052,7 @@ static int _target_source_callback(str fileName, void* userData, int line, const
 		return 1;
 	}
 
-	source           = &_g_sources[_g_sourceCount];
-	source->target   = target;
-	source->fileName = fileName;
+	source = &_g_sources[_g_sourceCount];
 
 	if(_str_ieq(fileExt, _s(".c")) ||
 	   _str_ieq(fileExt, _s(".m"))) {
@@ -1065,7 +1063,11 @@ static int _target_source_callback(str fileName, void* userData, int line, const
 	          _str_ieq(fileExt, _s(".mm"))) {
 		source->kind = CppSrc;
 	} else if(_str_ieq(fileExt, _s(".rc"))) {
+#if OS == OS_WINDOWS
 		source->kind = RcSrc;
+#else
+		return 0;
+#endif
 	} else if(_str_ieq(fileExt, _s(".h")) ||
 	          _str_ieq(fileExt, _s(".hpp")) ||
 	          _str_ieq(fileExt, _s(".hxx")) ||
@@ -1077,6 +1079,9 @@ static int _target_source_callback(str fileName, void* userData, int line, const
 		_log_raw(_s("'"));
 		return 1;
 	}
+
+	source->target   = target;
+	source->fileName = fileName;
 
 	++_g_sourceCount;
 	++target->_sourceCount;
@@ -1530,22 +1535,25 @@ static int _build_compiler_cmdline(const _source* source, str buildDir, _cmdline
 	_check(_cmdline_add_arg(compiler, cmdLine));
 
 #if COMPILER == COMPILER_MSVC
-	_check(_cmdline_add_arg(_s("/nologo"), cmdLine));
+	if(source->kind != RcSrc) /* Later versions of rc do support /nologo but better be safe and not use it */
+		_check(_cmdline_add_arg(_s("/nologo"), cmdLine));
 #endif
 
+	if(source->kind != RcSrc) {
 #if COMPILER == COMPILER_MSVC
-	_check(_cmdline_add_arg(_s("/c"), cmdLine));
+		_check(_cmdline_add_arg(_s("/c"), cmdLine));
 #else
-	_check(_cmdline_add_arg(_s("-c"), cmdLine));
+		_check(_cmdline_add_arg(_s("-c"), cmdLine));
 #endif
+	}
 
-	_check(_cmdline_add_compile_options(source, buildDir, &_g_compileOptions, &source->target->compileOpt, cmdLine));
+	if(source->kind != RcSrc) /* TODO: Separate include paths and defines and pass them to rc */
+		_check(_cmdline_add_compile_options(source, buildDir, &_g_compileOptions, &source->target->compileOpt, cmdLine));
 
-#if COMPILER == COMPILER_MSVC
-	_check(_cmdline_add_arg(_s("/Fo"), cmdLine));
-#else
-	_check(_cmdline_add_arg(_s("-o"), cmdLine));
-#endif
+	if(COMPILER == COMPILER_MSVC || (COMPILER == COMPILER_CLANG && source->kind == RcSrc))
+		_check(_cmdline_add_arg(_s("/Fo"), cmdLine));
+	else
+		_check(_cmdline_add_arg(_s("-o"), cmdLine));
 
 	pathBuffer.len = 0;
 	_check(_make_target_filepath(source->fileName, buildDir, ObjectFile, &pathBuffer));
