@@ -65,10 +65,10 @@
  * Macros
  */
 
-#define _strify_helper(x) #x
-#define _strify(x) _strify_helper(x)
+#define _stringify_helper(x) #x
+#define _stringify(x) _stringify_helper(x)
 
-#define _array_count(a) (sizeof(a) / sizeof(a[0]))
+#define _array_count(a) (int)(sizeof(a) / sizeof(a[0]))
 
 #undef  NONE
 #define NONE (void*)0
@@ -92,6 +92,14 @@
 
 #ifndef MAX_TARGETS
 	#define MAX_TARGETS 16
+#endif
+
+#ifndef MAX_TARGET_DEPENDENCIES
+	#define MAX_TARGET_DEPENDENCIES 8
+#endif
+
+#if MAX_TARGET_DEPENDENCIES > MAX_TARGETS
+	#error "MAX_TARGET_DEPENDENCIES cannot be larger than MAX_TARGETS"
 #endif
 
 #ifndef MAX_SOURCES
@@ -217,10 +225,10 @@ struct _target {
 	_compileoptions compileOpt;
 	_linkoptions    linkOpt;
 	_bool           _skipBuild;
-	_bool           _isBuilt;
+	_bool           _isLinkTarget;
 	int             _sourceCount;
 	int             _linkDependencyCount;
-	Target          _linkDependencies[8];
+	Target          _linkDependencies[MAX_TARGET_DEPENDENCIES];
 };
 
 typedef enum{
@@ -284,6 +292,18 @@ static int    _g_win32ProcessCount = 0;
 #endif
 
 /*
+ * Ignore warnings
+ */
+
+#if COMPILER == COMPILER_MSVC
+	#pragma warning(push)
+	#pragma warning(disable: 4210) /* nonstandard extension used : function given file scope */
+#elif COMPILER == COMPILER_GCC || COMPILER == COMPILER_CLANG
+	#pragma GCC diagnostic push
+	#pragma GCC diagnostic ignored "-Wcast-function-type" /* GetProcAddress return value */
+#endif
+
+/*
  * Memory functions
  */
 
@@ -291,15 +311,15 @@ static void* mem_fill(void* dest, int fill, int size) {
 	const _byte val = (_byte)fill;
 	_byte* d;
 
-	for(d = dest; size; --size, ++d)
+	for(d = (_byte*)dest; size; --size, ++d)
 		*d = val;
 
 	return dest;
 }
 
 static void* mem_copy(void* dest, const void* src, int size) {
-	const _byte* srcByte  = src;
-	_byte*       destByte = dest;
+	const _byte* srcByte  = (const _byte*)src;
+	_byte*       destByte = (_byte*)dest;
 
 	while(size) {
 		*destByte = *srcByte;
@@ -377,15 +397,15 @@ static _bool is_pathsep(int c) {
 #define _import __declspec(dllimport)
 #define _winapi __stdcall
 
-#ifdef NO_CRT
+#if defined(NO_CRT) && COMPILER == COMPILER_MSVC
 	#pragma comment(lib, "kernel32.lib")
 #endif
 
 #ifndef _WINBASE_
 
 typedef struct {
-	void*         hProcess;
-	void*         hThread;
+	void*  hProcess;
+	void*  hThread;
 	_ulong dwProcessId;
 	_ulong dwThreadId;
 } PROCESS_INFORMATION;
@@ -420,8 +440,8 @@ typedef struct{
 		} DUMMYSTRUCTNAME;
 	} DUMMYUNIONNAME;
 	_ulong  dwPageSize;
-	void*          lpMinimumApplicationAddress;
-	void*          lpMaximumApplicationAddress;
+	void*   lpMinimumApplicationAddress;
+	void*   lpMaximumApplicationAddress;
 	_ulong* dwActiveProcessorMask;
 	_ulong  dwNumberOfProcessors;
 	_ulong  dwProcessorType;
@@ -482,7 +502,7 @@ _import int _winapi WriteFile(void* hFile, const void* lpBuffer, _ulong nNumberO
 
 _import int _winapi CreateDirectoryW(const _wchar* lpPathName, SECURITY_ATTRIBUTES* lpSecurityAttributes);
 
-#define INFINITE 0xffffffff
+#define INFINITE    0xffffffff
 #define WAIT_FAILED 0xffffffff
 
 _import _ulong _winapi WaitForSingleObject(void* hHandle, _ulong dwMilliseconds);
@@ -700,7 +720,7 @@ static void _log_err(str msg, int line, const char* file);
 
 static int _path_append_raw(str s, _pathbuffer* buffer) {
 	if(buffer->len + s.len > MAX_PATH) {
-		_log_err(_s("Path too long, define MAX_PATH to increase limit (" _strify(MAX_PATH) ")"), -1, NONE);
+		_log_err(_s("Path too long, define MAX_PATH to increase limit (" _stringify(MAX_PATH) ")"), -1, NONE);
 		return 1;
 	}
 
@@ -991,21 +1011,29 @@ static int _parse_list(const char* list, int(*callback)(str, void*, int, const c
  * Target
  */
 
-static Target find_target(const char* name) {
+static Target _find_target(str name) {
 	int i;
 
 	for(i = 0; i < _g_targetCount; ++i) {
-		if(str_ieq(name, _g_targets[i].name))
+		if(_str_ieq(name, _cstr(_g_targets[i].name)))
 			return &_g_targets[i];
 	}
 
 	return NONE;
 }
 
+static Target find_target(const char* name) {
+	return _find_target(_cstr(name));
+}
+
+static _bool _is_target_ptr(const void* ptr) {
+	return ptr != NONE && (Target)ptr >= &_g_targets[0] && (Target)ptr < _g_targets + MAX_TARGETS;
+}
+
 static Target _get_target(const void* targetOrTargetName, int line, const char* file) {
 	Target target = (Target)targetOrTargetName;
 
-	if(target != NONE && !(target >= &_g_targets[0] && target < &_g_targets[MAX_TARGETS - 1]))
+	if(!_is_target_ptr(targetOrTargetName))
 		target = find_target((const char*)targetOrTargetName);
 
 	if(target == NONE)
@@ -1020,7 +1048,7 @@ static int _target_source_callback(str fileName, void* userData, int line, const
 	_source*  source;
 
 	if(_g_sourceCount >= MAX_SOURCES) {
-		_log_err(_s("Too many sources, define MAX_SOURCES to increase limit (" _strify(MAX_SOURCES) ")"), line, file);
+		_log_err(_s("Too many sources, define MAX_SOURCES to increase limit (" _stringify(MAX_SOURCES) ")"), line, file);
 		return 1;
 	}
 
@@ -1071,7 +1099,7 @@ static int _add_target(const char* name, _target_type type, const char* sources,
 	Target       target;
 
 	if(_g_targetCount >= MAX_TARGETS) {
-		_log_err(_s("Too many targets, define MAX_TARGETS to increase limit (" _strify(MAX_TARGETS) ")"), line, file); \
+		_log_err(_s("Too many targets, define MAX_TARGETS to increase limit (" _stringify(MAX_TARGETS) ")"), line, file); \
 		 return 1;
 	}
 
@@ -1182,6 +1210,7 @@ static int _make_target_filepath(str baseName, str buildDir, _target_type target
 		_check(_path_append_raw(_file_basename(_file_without_path(baseName)), buffer));
 
 	_check(_path_append_raw(_target_file_ext(targetType), buffer));
+
 	return 0;
 }
 
@@ -1353,7 +1382,7 @@ static int _cmdline_arg_push(str s, _cmdlinebuffer* cmdLine, int append) {
 	return 0;
 
 too_long:
-	log_err("Command line too long, define MAX_COMMAND_LINE to increase limit (" _strify(MAX_COMMAND_LINE) ")");
+	log_err("Command line too long, define MAX_COMMAND_LINE to increase limit (" _stringify(MAX_COMMAND_LINE) ")");
 	return 1;
 }
 
@@ -1363,7 +1392,7 @@ too_long:
 static int _cmdline_combine(_cmdlinebuffer* cmdLine, const _cmdlinebuffer* other) {
 #if OS == OS_WINDOWS
 	if(cmdLine->len + other->len > MAX_COMMAND_LINE) {
-		log_err("Command line too long, define MAX_COMMAND_LINE to increase limit (" _strify(MAX_COMMAND_LINE) ")");
+		log_err("Command line too long, define MAX_COMMAND_LINE to increase limit (" _stringify(MAX_COMMAND_LINE) ")");
 		return 1;
 	}
 
@@ -1744,20 +1773,118 @@ static int _add_defines_callback(str defineStr, void* userData, int line, const 
 		_check(_parse_list(flag_list, _add_flags_callback, &_target->linkOpt._flags, __LINE__, __FILE__)); \
 	} while((void)0,0)
 
-static int _add_libs_callback(str lib, void* userData, int line, const char* file) {
-	_cmdlinebuffer* cmdLine = (_cmdlinebuffer*)userData;
-	(void)line;
-	(void)file;
-
+static int _target_lib_path(str libPath, _cmdlinebuffer* cmdLine) {
+	if(libPath.len >= 0) {
 #if COMPILER == COMPILER_MSVC
-	_check(_cmdline_add_arg(lib, cmdLine));
+		_check(_cmdline_add_arg(_s("/LIBPATH:"), cmdLine));
+#else
+		_check(_cmdline_add_arg(_s("-L"), cmdLine));
+#endif
+	}
 
-	if(_file_ext(lib).len == 0)
+	_check(_cmdline_append_arg(libPath, cmdLine));
+
+	return 0;
+}
+
+static int _target_link_lib(str libName, _cmdlinebuffer* cmdLine) {
+#if COMPILER == COMPILER_MSVC
+	_check(_cmdline_add_arg(libName, cmdLine));
+
+	if(_file_ext(libName).len == 0)
 		_check(_cmdline_append_arg(_s(".lib"), cmdLine));
 #else
 	_check(_cmdline_add_arg(_s("-l"), cmdLine));
-	_check(_cmdline_append_arg(lib, cmdLine));
+	_check(_cmdline_append_arg(libName, cmdLine));
 #endif
+
+	return 0;
+}
+
+static _bool _target_depends_on(Target target, Target dependency) {
+	Target stack[MAX_TARGETS];
+	_bool  visited[MAX_TARGETS] = {0};
+	int    stackSize;
+	int    i;
+
+	stack[0]  = target;
+	stackSize = 1;
+
+	while(stackSize > 0) {
+		Target currentTarget = stack[--stackSize];
+
+		for(i = 0; i < currentTarget->_linkDependencyCount; ++i) {
+			Target dependencyTarget = currentTarget->_linkDependencies[i];
+
+			if(visited[dependencyTarget - _g_targets])
+				continue;
+
+			stack[stackSize++] = dependencyTarget;
+
+			if(dependencyTarget == dependency)
+				return true;
+		}
+
+		visited[currentTarget - _g_targets] = true;
+	}
+
+	return false;
+}
+
+static int _target_link(Target target, Target linkedTarget, int line, const char* file) {
+	_pathbuffer targetBuildDirBuffer;
+	_pathbuffer targetLibDirBuffer;
+	int         i;
+
+	if(linkedTarget == NONE)
+		return 0;
+
+	for(i = 0; i < target->_linkDependencyCount; ++i) {
+		if(target->_linkDependencies[i] == linkedTarget)
+			return 0;
+	}
+
+	if(target->_linkDependencyCount >= _array_count(target->_linkDependencies)) {
+		_log_err(_s("Too many dependencies for target. Define MAX_TARGET_DEPENDENCIES to increase limit (" _stringify(MAX_TARGET_DEPENDENCIES) ")"), line, file);
+		return 1;
+	}
+
+	if(target == linkedTarget || _target_depends_on(linkedTarget, target)) {
+		_log_err(_s("Target dependency cycle"), line, file);
+		return 1;
+	}
+
+	target->_linkDependencies[target->_linkDependencyCount++] = linkedTarget;
+	linkedTarget->_isLinkTarget = true;
+
+	targetBuildDirBuffer.len = 0;
+	_check(_path_add_segment(_g_buildDir, &targetBuildDirBuffer));
+	_check(_path_add_segment(_rel_build_path(linkedTarget->projectDir), &targetBuildDirBuffer));
+
+	targetLibDirBuffer.len = 0;
+	_check(_make_target_filepath(_cstr(linkedTarget->name), _str(targetBuildDirBuffer.data, targetBuildDirBuffer.len), linkedTarget->type, &targetLibDirBuffer));
+
+	_check(_target_lib_path(_path_without_file(_str(targetLibDirBuffer.data, targetLibDirBuffer.len)), &target->linkOpt._flags));
+	_check(_target_link_lib(_cstr(linkedTarget->name), &target->linkOpt._flags));
+
+	return 0;
+}
+
+static int _add_libs_callback(str lib, void* userData, int line, const char* file) {
+	Target target     = NONE;
+	Target linkTarget = _find_target(lib);
+	(void)line;
+	(void)file;
+
+	if(_is_target_ptr(userData))
+		target = (Target)userData;
+
+	if(linkTarget) {
+		if(target)
+			_check(_target_link(target, linkTarget, line, file));
+	} else {
+		_check(_target_link_lib(lib, target ? &target->linkOpt._flags : (_cmdlinebuffer*)userData));
+	}
 
 	return 0;
 }
@@ -1765,26 +1892,22 @@ static int _add_libs_callback(str lib, void* userData, int line, const char* fil
 #define link_libraries(library_list) \
 	_check(_parse_list(library_list, _add_libs_callback, &_g_linkOptions._flags, __LINE__, __FILE__))
 
-#define target_link_libraries(target_or_target_name, library_list) \
+#define target_link_libraries(target_or_target_name, library_list_or_target) \
 	do { \
-		Target _target = _get_target(target_or_target_name, __LINE__, __FILE__); \
-		if(_target == NONE) \
+		Target target = _get_target(target_or_target_name, __LINE__, __FILE__); \
+		if(target == NONE) \
 			return 1; \
-		_check(_parse_list(library_list, _add_libs_callback, &_target->linkOpt._flags, __LINE__, __FILE__)); \
+		if(_is_target_ptr(library_list_or_target)) \
+			_check(_target_link(target, (Target)library_list_or_target, __LINE__, __FILE__)); \
+		else \
+			_check(_parse_list(library_list_or_target, _add_libs_callback, target, __LINE__, __FILE__)); \
 	} while((void)0,0)
 
 static int _add_lib_paths_callback(str libPath, void* userData, int line, const char* file) {
 	_cmdlinebuffer* cmdLine = (_cmdlinebuffer*)userData;
 	(void)line;
 	(void)file;
-
-#if COMPILER == COMPILER_MSVC
-	_check(_cmdline_add_arg(_s("/LIBPATH:"), cmdLine));
-#else
-	_check(_cmdline_add_arg(_s("-L"), cmdLine));
-#endif
-
-	_check(_cmdline_append_arg(libPath, cmdLine));
+	_target_lib_path(libPath, cmdLine);
 
 	return 0;
 }
@@ -1927,6 +2050,27 @@ static int _add_link_job(Target target, str outPath) {
  * Build
  */
 
+static void _sort_targets_by_link_order(Target* targets, int count) {
+	int j;
+
+	for(j = 1; j < count; ++j) {
+		_bool swapped = false;
+		int   i;
+
+		for(i = 0; i < count - j; ++i) {
+			if(_target_depends_on(targets[i], targets[i + 1])) {
+				Target tmp = targets[i];
+				targets[i]     = targets[i + 1];
+				targets[i + 1] = tmp;
+				swapped        = true;
+			}
+		}
+
+		if(!swapped)
+			break;
+	}
+}
+
 static int _build(void) {
 	_pathbuffer pathBuffer = {0};
 	str         buildDirBase;
@@ -1947,6 +2091,13 @@ static int _build(void) {
 				_log_raw(_cstr(*nameIt));
 				_log_raw(_s("'"));
 				return 0;
+			}
+
+			for(i = 0; i < _g_targetCount; ++i) {
+				Target dependency = &_g_targets[i];
+
+				if(dependency != target && dependency->_skipBuild && _target_depends_on(target, dependency))
+					_g_targets[i]._skipBuild = false;
 			}
 
 			target->_skipBuild = false;
@@ -1986,26 +2137,40 @@ static int _build(void) {
 	if(exitCode != 0)
 		return exitCode;
 
-	for(i = 0; i < _g_targetCount; ++i) {
-		Target target = &_g_targets[i];
+	/* TODO: Move compilation and link steps into separate functions */
+	{
+		Target    targets[MAX_TARGETS];
+		const int targetCount = _g_targetCount;
 
-		if(target->_skipBuild)
-			continue;
+		for(i = 0; i < targetCount; ++i)
+			targets[i] = &_g_targets[i];
 
-		pathBuffer.len = buildDirBase.len;
-		_check(_path_add_segment(_rel_build_path(target->projectDir), &pathBuffer));
+		_sort_targets_by_link_order(targets, targetCount);
 
-		exitCode       = _add_link_job(target, _str(pathBuffer.data, pathBuffer.len));
-		pathBuffer.len = buildDirBase.len;
+		for(i = 0; i < targetCount; ++i) {
+			Target target = targets[i];
 
-		if(exitCode != 0) {
-			_wait_jobs();
-			break;
+			if(target->_skipBuild)
+				continue;
+
+			pathBuffer.len = buildDirBase.len;
+			_check(_path_add_segment(_rel_build_path(target->projectDir), &pathBuffer));
+
+			exitCode       = _add_link_job(target, _str(pathBuffer.data, pathBuffer.len));
+			pathBuffer.len = buildDirBase.len;
+
+			if(exitCode != 0) {
+				_wait_jobs();
+				break;
+			}
+
+			if(target->_isLinkTarget)
+				_check(_wait_jobs()); /* Can't link targets which are linked against by others in parallel */
 		}
-	}
 
-	if(exitCode == 0)
-		exitCode = _wait_jobs();
+		if(exitCode == 0)
+			exitCode = _wait_jobs();
+	}
 
 	return exitCode;
 }
@@ -2023,10 +2188,6 @@ static int _build(void) {
 		} while((void)0,0); \
 		return _build(); \
 	}
-
-#if COMPILER == COMPILER_MSVC
-	#pragma warning(disable: 4210) /* nonstandard extension used : function given file scope */
-#endif
 
 #define add_project(project_identifier) \
 	do { \
@@ -2128,10 +2289,8 @@ static int _parse_args(int argc, char** argv) {
 					break;
 				}
 			case 'v':
-				if(argLen == 2) {
-					_g_verbose = true;
-					break;
-				}
+				_g_verbose = true;
+				break;
 			case 'b':
 				{
 					const char* buildDir = NONE;
@@ -2166,6 +2325,7 @@ static int _parse_args(int argc, char** argv) {
 						break;
 					}
 				}
+				/* fallthrough */
 			default:
 				_log_err(_s("Unknown argument '"), -1, NONE);
 				_log_raw(_s(arg));
@@ -2261,7 +2421,17 @@ void* __cdecl memmove(void* dest, const void* src, unsigned long long size) {
 }
 #endif
 
+#if COMPILER == COMPILER_MSVC
+	#pragma warning(pop)
+#elif COMPILER == COMPILER_GCC || COMPILER == COMPILER_CLANG
+	#pragma GCC diagnostic pop
+#endif
+
 #else
+/*
+ * If build.h was already included, change the begin_project and end_project macros.
+ * Subproject files must be included after the main begin_project/end_project or compiled as separate compilation units.
+ */
 
 #undef begin_project
 #define begin_project(project_identifier) \
