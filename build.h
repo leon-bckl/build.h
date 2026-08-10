@@ -1781,6 +1781,9 @@ static int _add_include_paths_callback(str includePath, void* userData, int line
 #endif
 
 	if(!_path_is_abs(includePath)) {
+		if(!_path_is_abs(_g_currentProjectDir))
+			_check(_cmdline_append_arg(_g_cwd, cmdLine));
+
 		_check(_cmdline_append_arg(_g_currentProjectDir, cmdLine));
 		_check(_cmdline_append_arg(includePath, cmdLine));
 	} else {
@@ -2038,12 +2041,12 @@ static int _wait_jobs(void) {
 	return exitCode;
 }
 
-static int _add_job(_cmdlinebuffer cmdLine, str workingDir) {
+static int _add_job(const _cmdlinebuffer* cmdLine, str workingDir) {
 #if OS == OS_WINDOWS
 	_wchar              workingDirBuffer[MAX_PATH];
 	_wchar              cmdLineBuffer[MAX_COMMAND_LINE + 1];
 	const int           workingDirLen      = MultiByteToWideChar(CP_UTF8, 0, workingDir.data, workingDir.len, workingDirBuffer, MAX_PATH);
-	const int           cmdLineLen         = MultiByteToWideChar(CP_UTF8, 0, cmdLine.buffer, cmdLine.len, cmdLineBuffer, MAX_COMMAND_LINE + 1);
+	const int           cmdLineLen         = MultiByteToWideChar(CP_UTF8, 0, cmdLine->buffer, cmdLine->len, cmdLineBuffer, MAX_COMMAND_LINE + 1);
 	STARTUPINFOW        startupInfo        = {0};
 	PROCESS_INFORMATION processInfo        = {0};
 	SECURITY_ATTRIBUTES securityAttributes = {0};
@@ -2101,7 +2104,7 @@ static int _add_job(_cmdlinebuffer cmdLine, str workingDir) {
 		CloseHandle(stdoutRead);
 		CloseHandle(stdoutWrite);
 		_log_err(_s("Failed to start process '"), -1, NONE);
-		_log_raw(_str(cmdLine.buffer, cmdLine.len));
+		_log_raw(_str(cmdLine->buffer, cmdLine->len));
 		_log_raw(_s("'"));
 		return (int)GetLastError();
 	}
@@ -2145,7 +2148,7 @@ static int _add_compile_job(_source* source, str objFilePath) {
 	_log_raw(_s("] "));
 	_log_raw(_file_without_path(source->fileName));
 
-	return _add_job(cmdLine, source->target->projectDir);
+	return _add_job(&cmdLine, source->target->projectDir);
 }
 
 static int _add_link_job(Target target) {
@@ -2164,7 +2167,7 @@ static int _add_link_job(Target target) {
 	_log_raw(_cstr(target->name));
 	_log_raw(_target_file_ext(target->type));
 
-	return _add_job(cmdLine, target->projectDir);
+	return _add_job(&cmdLine, target->projectDir);
 }
 
 /*
@@ -2304,6 +2307,9 @@ static int _build(void) {
 		int project_identifier ## _main(void); \
 		_check(project_identifier ## _main()); \
 	} while((void)0,0)
+
+#define project_directory(directory_name) \
+	_g_currentProjectDir = _cstr(directory_name)
 
 /*
  * Init/deinit
