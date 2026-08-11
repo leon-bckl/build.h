@@ -71,7 +71,16 @@
 #define _array_count(a) (int)(sizeof(a) / sizeof(a[0]))
 
 #undef  NONE
-#define NONE (void*)0
+
+#ifdef __cplusplus
+	#if __cplusplus >= 201103L
+		#define NONE nullptr
+	#else
+		#define NONE 0
+	#endif
+#else
+	#define NONE (void*)0
+#endif
 
 #define _check(expr) \
 	do { \
@@ -134,12 +143,10 @@ typedef unsigned short _wchar;
 typedef int            _bool;
 
 #ifndef __cplusplus
-	#ifndef true
-		#define true 1
-	#endif
-	#ifndef false
-		#define false 0
-	#endif
+	#undef  true
+	#define true  1
+	#undef  false
+	#define false 0
 #endif
 
 typedef struct {
@@ -213,7 +220,7 @@ typedef struct {
 	_cmdlinebuffer _flags;
 } _linkoptions;
 
-typedef enum _target_type {
+typedef enum {
 	ObjectFile,
 	DebugInformation,
 	Executable,
@@ -226,7 +233,7 @@ typedef struct _target* Target;
 struct _target {
 	const char*     name;
 	str             projectDir;
-	_artifact_type    type;
+	_artifact_type  type;
 	_compileoptions compileOpt;
 	_linkoptions    linkOpt;
 	_filetime       _lastModified;
@@ -261,7 +268,7 @@ typedef struct {
 
 _buildconfig           buildConfiguration = Debug;
 
-static const str       _emptyString = {0};
+static const str       _emptyString = {NONE, 0};
 
 static str             _g_buildDir;
 static str             _g_currentProjectDir;
@@ -291,18 +298,12 @@ static _bool           _g_logAtNewline = true;
 static void*  _g_win32StdoutHandle = NONE;
 static int    _g_win32Argc         = 0;
 static char*  _g_win32Argv[128];
-static char   _g_win32ArgvBuffer[512];
+static char   _g_win32ArgvBuffer[MAX_COMMAND_LINE];
 static int    _g_win32CwdLen = 0;
 static _wchar _g_win32Cwd[MAX_PATH];
+static int    _g_win32ProcessCount = 0;
 static void*  _g_win32Processes[MAX_JOBS + 1]; /* +1 so the last entry is always NONE */
-
-typedef struct {
-	void* stdoutRead;
-	void* stdoutWrite;
-} _win32processoutput;
-
-static _win32processoutput  _g_win32ProcessOutput[MAX_JOBS + 1]; /* +1 so the last entry is always NONE */
-static int                  _g_win32ProcessCount = 0;
+static void*  _g_win32ProcessStdOut[MAX_JOBS + 1]; /* +1 so the last entry is always NONE */
 #endif
 
 /*
@@ -526,7 +527,10 @@ _import int _winapi GetFileAttributesExW(const _wchar* lpFileName, GET_FILEEX_IN
 _import int _winapi ReadFile(void* hFile, void* lpBuffer, _ulong nNumberOfBytesToRead, _ulong* lpNumberOfBytesRead, OVERLAPPED* lpOverlapped);
 _import int _winapi WriteFile(void* hFile, const void* lpBuffer, _ulong nNumberOfBytesToWrite, _ulong* lpNumberOfBytesWritten, void* lpOverlapped);
 
+_import _ulong _winapi GetModuleFileNameW(void* hModule, _wchar* lpFilename, _ulong nSize);
+
 _import int _winapi CreateDirectoryW(const _wchar* lpPathName, SECURITY_ATTRIBUTES* lpSecurityAttributes);
+_import int _winapi MoveFileExW(const _wchar* lpExistingFileName, const _wchar* lpNewFileName, _ulong dwFlags);
 
 #define INFINITE    0xffffffff
 #define WAIT_FAILED 0xffffffff
@@ -565,6 +569,20 @@ static int _win32_assemble_path(str path, _wchar* buffer) {
 	}
 
 	return 0;
+}
+
+static void _win32_get_lastmodified(const _wchar* filePath, _filetime* fileTime) {
+	WIN32_FILE_ATTRIBUTE_DATA attributes;
+
+	mem_fill(&attributes, 0, sizeof(attributes));
+
+	fileTime->hi = 0;
+	fileTime->lo = 0;
+
+	if(GetFileAttributesExW(filePath, GetFileExInfoStandard, &attributes)) {
+		fileTime->hi = attributes.ftLastWriteTime.dwHighDateTime;
+		fileTime->lo = attributes.ftLastWriteTime.dwLowDateTime;
+	}
 }
 #endif
 
@@ -1069,17 +1087,11 @@ static Target _get_target(const void* targetOrTargetName, int line, const char* 
 }
 
 static void _get_lastmodified(str filePath, _filetime* fileTime) {
-	_wchar                    path[MAX_PATH];
-	WIN32_FILE_ATTRIBUTE_DATA attributes = {0};
-	fileTime->hi = 0;
-	fileTime->lo = 0;
-
-	_win32_assemble_path(filePath, path);
-
-	if(GetFileAttributesExW(path, GetFileExInfoStandard, &attributes)) {
-		fileTime->hi = attributes.ftLastWriteTime.dwHighDateTime;
-		fileTime->lo = attributes.ftLastWriteTime.dwLowDateTime;
-	}
+#if OS == OS_WINDOWS
+	_wchar wPath[MAX_PATH];
+	_win32_assemble_path(filePath, wPath);
+	_win32_get_lastmodified(wPath, fileTime);
+#endif
 }
 
 static int _assemble_source_path(const _source* source, _pathbuffer* pathBuffer) {
@@ -1179,8 +1191,8 @@ static str _rel_build_path(str path) {
 	return path;
 }
 
-static str _target_file_ext(_artifact_type targetType) {
-	switch(targetType) {
+static str _artifact_file_ext(_artifact_type artifactType) {
+	switch(artifactType) {
 	case ObjectFile:
 #if COMPILER == COMPILER_MSVC
 		return _s(".obj");
@@ -1218,7 +1230,7 @@ static str _target_file_ext(_artifact_type targetType) {
 	}
 }
 
-static int _make_artifact_filepath(str baseName, str projectDir, _artifact_type targetType, _pathbuffer* buffer) {
+static int _make_artifact_filepath(str baseName, str projectDir, _artifact_type artifactType, _pathbuffer* buffer) {
 	if(!_path_is_abs(_g_buildDir))
 		_check(_path_add_segment(_g_cwd, buffer));
 
@@ -1230,12 +1242,12 @@ static int _make_artifact_filepath(str baseName, str projectDir, _artifact_type 
 	 * Keep original extension for object and pbd files and add target extension at
 	 * the end, to avoid ambiguities if a source file has the same name as the target
 	 * */
-	if(targetType == ObjectFile || targetType == DebugInformation)
+	if(artifactType == ObjectFile || artifactType == DebugInformation)
 		_check(_path_append_raw(_file_without_path(baseName), buffer));
 	else
 		_check(_path_append_raw(_file_basename(_file_without_path(baseName)), buffer));
 
-	_check(_path_append_raw(_target_file_ext(targetType), buffer));
+	_check(_path_append_raw(_artifact_file_ext(artifactType), buffer));
 
 	return 0;
 }
@@ -1325,10 +1337,10 @@ static str _compiler_executable(_sourcekind sourceKind) {
 	}
 }
 
-static str _linker_executable(_artifact_type targetType) {
-	(void)targetType;
+static str _linker_executable(_artifact_type artifactType) {
+	(void)artifactType;
 #if COMPILER == COMPILER_MSVC
-	if(targetType == StaticLibrary)
+	if(artifactType == StaticLibrary)
 		return _s("lib");
 
 	return _s("link");
@@ -1854,7 +1866,15 @@ static int _target_lib_path(str libPath, _cmdlinebuffer* cmdLine) {
 		_check(_cmdline_add_arg(_s("-L"), cmdLine));
 #endif
 
-		_check(_cmdline_append_arg(libPath, cmdLine));
+		if(!_path_is_abs(libPath)) {
+			if(!_path_is_abs(_g_currentProjectDir))
+				_check(_cmdline_append_arg(_g_cwd, cmdLine));
+
+			_check(_cmdline_append_arg(_g_currentProjectDir, cmdLine));
+			_check(_cmdline_append_arg(libPath, cmdLine));
+		} else {
+			_check(_cmdline_append_arg(libPath, cmdLine));
+		}
 	}
 
 	return 0;
@@ -1997,17 +2017,23 @@ static int _add_lib_paths_callback(str libPath, void* userData, int line, const 
  * Process creation
  */
 
-static void _log_job_output(int jobIdx) {
+static void _log_job_output(int jobIdx, _bool logError) {
 #if OS == OS_WINDOWS
 	char   buffer[512];
-	_ulong bytesRead = 0;
+	_ulong bytesRead    = 0;
+	void*  outputHandle = _g_win32ProcessStdOut[jobIdx];
 
-	_log_err(_emptyString, -1, NONE);
+	if(outputHandle) {
+		if(logError)
+			_log_err(_emptyString, -1, NONE);
+		else
+			_log_msg(_emptyString, -1, NONE);
 
-	do {
-		ReadFile(_g_win32ProcessOutput[jobIdx].stdoutRead, buffer, sizeof(buffer), &bytesRead, NONE);
-		_log_raw(_str(buffer, (int)bytesRead));
-	} while(bytesRead == sizeof(buffer));
+		do {
+			ReadFile(outputHandle, buffer, sizeof(buffer), &bytesRead, NONE);
+			_log_raw(_str(buffer, (int)bytesRead));
+		} while(bytesRead == sizeof(buffer));
+	}
 #endif
 }
 
@@ -2027,32 +2053,39 @@ static int _wait_jobs(void) {
 
 			if(procExit != 0) {
 				exitCode = (int)procExit;
-				_log_job_output(i);
+				_log_job_output(i, true);
 			}
 		}
 
+		CloseHandle(_g_win32ProcessStdOut);
 		CloseHandle(hProcess);
 	}
 
 	mem_fill(_g_win32Processes, 0, sizeof(_g_win32Processes));
-	mem_fill(_g_win32ProcessOutput, 0, sizeof(_g_win32ProcessOutput));
+	mem_fill(_g_win32ProcessStdOut, 0, sizeof(_g_win32ProcessStdOut));
 	_g_win32ProcessCount = 0;
 
 	return exitCode;
 }
 
-static int _add_job(const _cmdlinebuffer* cmdLine, str workingDir) {
+static int _add_job(const _cmdlinebuffer* cmdLine, str workingDir, _bool redirectOutput) {
 #if OS == OS_WINDOWS
 	_wchar              workingDirBuffer[MAX_PATH];
 	_wchar              cmdLineBuffer[MAX_COMMAND_LINE + 1];
-	const int           workingDirLen      = MultiByteToWideChar(CP_UTF8, 0, workingDir.data, workingDir.len, workingDirBuffer, MAX_PATH);
-	const int           cmdLineLen         = MultiByteToWideChar(CP_UTF8, 0, cmdLine->buffer, cmdLine->len, cmdLineBuffer, MAX_COMMAND_LINE + 1);
-	STARTUPINFOW        startupInfo        = {0};
-	PROCESS_INFORMATION processInfo        = {0};
-	SECURITY_ATTRIBUTES securityAttributes = {0};
-	void*               stdoutRead;
-	void*               stdoutWrite;
+	const int           workingDirLen = MultiByteToWideChar(CP_UTF8, 0, workingDir.data, workingDir.len, workingDirBuffer, MAX_PATH);
+	const int           cmdLineLen    = MultiByteToWideChar(CP_UTF8, 0, cmdLine->buffer, cmdLine->len, cmdLineBuffer, MAX_COMMAND_LINE + 1);
+	STARTUPINFOW        startupInfo;
+	PROCESS_INFORMATION processInfo;
+	SECURITY_ATTRIBUTES securityAttributes;
+	void*               stdoutRead  = NONE;
+	void*               stdoutWrite = NONE;
 
+	workingDirBuffer[workingDirLen] = '\0';
+	cmdLineBuffer[cmdLineLen]       = '\0';
+
+	mem_fill(&startupInfo, 0, sizeof(startupInfo));
+	mem_fill(&processInfo, 0, sizeof(processInfo));
+	mem_fill(&securityAttributes, 0, sizeof(securityAttributes));
 
 	/* Max job slots used, wait for one to finish */
 	if(_g_win32ProcessCount >= _g_maxJobs) {
@@ -2065,17 +2098,15 @@ static int _add_job(const _cmdlinebuffer* cmdLine, str workingDir) {
 		GetExitCodeProcess(_g_win32Processes[wait], &exitCode);
 
 		if(exitCode != 0)
-			_log_job_output((int)wait);
+			_log_job_output((int)wait, true);
 
 		CloseHandle(_g_win32Processes[wait]);
-		CloseHandle(_g_win32ProcessOutput[wait].stdoutRead);
-		CloseHandle(_g_win32ProcessOutput[wait].stdoutWrite);
+		CloseHandle(_g_win32ProcessStdOut[wait]);
 		--_g_win32ProcessCount;
-		_g_win32Processes[wait]                                 = _g_win32Processes[_g_win32ProcessCount];
-		_g_win32ProcessOutput[wait]                             = _g_win32ProcessOutput[_g_win32ProcessCount];
-		_g_win32Processes[_g_win32ProcessCount]                 = NONE;
-		_g_win32ProcessOutput[_g_win32ProcessCount].stdoutRead  = NONE;
-		_g_win32ProcessOutput[_g_win32ProcessCount].stdoutWrite = NONE;
+		_g_win32Processes[wait]                     = _g_win32Processes[_g_win32ProcessCount];
+		_g_win32ProcessStdOut[wait]                 = _g_win32ProcessStdOut[_g_win32ProcessCount];
+		_g_win32Processes[_g_win32ProcessCount]     = NONE;
+		_g_win32ProcessStdOut[_g_win32ProcessCount] = NONE;
 
 		if(exitCode != 0)
 			return (int)exitCode;
@@ -2084,35 +2115,44 @@ static int _add_job(const _cmdlinebuffer* cmdLine, str workingDir) {
 	securityAttributes.nLength        = sizeof(SECURITY_ATTRIBUTES);
 	securityAttributes.bInheritHandle = 1;
 
-	if(!CreatePipe(&stdoutRead, &stdoutWrite, &securityAttributes, 0)) {
-		_log_err(_s("Failed to create stdout pipe"), -1, NONE);
-		return (int)GetLastError();
+	startupInfo.cb      = sizeof(startupInfo);
+	startupInfo.dwFlags = 0x00000100; /* STARTF_USESTDHANDLES */
+
+	if(redirectOutput) {
+		if(!CreatePipe(&stdoutRead, &stdoutWrite, &securityAttributes, 0)) {
+			_log_err(_s("Failed to create stdout pipe"), -1, NONE);
+			return (int)GetLastError();
+		}
+
+		SetHandleInformation(stdoutRead, 1, 0); /* HANDLE_FLAG_INHERIT set to 0 */
+
+		startupInfo.hStdError  = stdoutWrite;
+		startupInfo.hStdOutput = stdoutWrite;
+	} else {
+		startupInfo.hStdError  = _g_win32StdoutHandle;
+		startupInfo.hStdOutput = _g_win32StdoutHandle;
 	}
 
-	workingDirBuffer[workingDirLen] = '\0';
-	cmdLineBuffer[cmdLineLen]       = '\0';
-
-	SetHandleInformation(stdoutRead, 1, 0); /* HANDLE_FLAG_INHERIT set to 0 */
-
-	startupInfo.cb         = sizeof(startupInfo);
-	startupInfo.dwFlags    = 0x00000100; /* STARTF_USESTDHANDLES */
-	/* Redirect all output to stdout */
-	startupInfo.hStdError  = stdoutWrite;
-	startupInfo.hStdOutput = stdoutWrite;
-
 	if(!CreateProcessW(NONE, cmdLineBuffer, NONE, NONE, 1, 0, NONE, workingDirLen > 0 ? workingDirBuffer : _g_win32Cwd, &startupInfo, &processInfo)) {
-		CloseHandle(stdoutRead);
-		CloseHandle(stdoutWrite);
+		if(stdoutRead)
+			CloseHandle(stdoutRead);
+
+		if(stdoutWrite)
+			CloseHandle(stdoutWrite);
+
 		_log_err(_s("Failed to start process '"), -1, NONE);
 		_log_raw(_str(cmdLine->buffer, cmdLine->len));
 		_log_raw(_s("'"));
 		return (int)GetLastError();
 	}
 
+	if(stdoutWrite)
+		CloseHandle(stdoutWrite);
+
 	CloseHandle(processInfo.hThread);
-	_g_win32Processes[_g_win32ProcessCount]                 = processInfo.hProcess;
-	_g_win32ProcessOutput[_g_win32ProcessCount].stdoutRead  = stdoutRead;
-	_g_win32ProcessOutput[_g_win32ProcessCount].stdoutWrite = stdoutWrite;
+
+	_g_win32Processes[_g_win32ProcessCount]     = processInfo.hProcess;
+	_g_win32ProcessStdOut[_g_win32ProcessCount] = stdoutRead;
 	++_g_win32ProcessCount;
 #endif
 
@@ -2148,7 +2188,7 @@ static int _add_compile_job(_source* source, str objFilePath) {
 	_log_raw(_s("] "));
 	_log_raw(_file_without_path(source->fileName));
 
-	return _add_job(&cmdLine, source->target->projectDir);
+	return _add_job(&cmdLine, source->target->projectDir, true);
 }
 
 static int _add_link_job(Target target) {
@@ -2165,9 +2205,9 @@ static int _add_link_job(Target target) {
 		_log_msg(_s("Linking "), -1, NONE);
 
 	_log_raw(_cstr(target->name));
-	_log_raw(_target_file_ext(target->type));
+	_log_raw(_artifact_file_ext(target->type));
 
-	return _add_job(&cmdLine, target->projectDir);
+	return _add_job(&cmdLine, target->projectDir, true);
 }
 
 /*
@@ -2196,7 +2236,7 @@ static void _sort_targets_by_link_order(Target* targets, int count) {
 }
 
 static int _build(void) {
-	_pathbuffer pathBuffer = {0};
+	_pathbuffer pathBuffer;
 	int         exitCode = 0;
 	int         i;
 
@@ -2288,13 +2328,138 @@ static int _build(void) {
 	return exitCode;
 }
 
+static int _rebuild_if_needed(const char* srcFile, int argc, char** argv, _bool* didRebuild) {
+	char        targetNameBuffer[64];
+	Target      target;
+	_source*    source;
+	str         targetName = _file_without_path(_file_basename(_cstr(srcFile)));
+#if OS == OS_WINDOWS
+	_wchar      wExePathBuffer[MAX_PATH];
+#endif
+
+	if(targetName.len >= (int)sizeof(targetNameBuffer) - 1) {
+		_log_err(_s("Build project file name too long"), -1, NONE);
+		return 1;
+	}
+
+	mem_copy(targetNameBuffer, targetName.data, targetName.len);
+	targetNameBuffer[targetName.len] = '\0';
+
+	_check(_add_target(targetNameBuffer, Executable, srcFile, -1, NONE));
+
+	target = &_g_targets[_g_targetCount - 1];
+	source = &_g_sources[_g_sourceCount - 1];
+
+	/*
+	 * Get lastmodified timestamp from actual executable file which might not be the same as the target.
+	 */
+
+#if OS == OS_WINDOWS
+	if(GetModuleFileNameW(NONE, wExePathBuffer, _array_count(wExePathBuffer)) == 0) {
+		_log_err(_s("GetModuleFileNameW failed"), -1, NONE);
+		return (int)GetLastError();
+	}
+
+	_win32_get_lastmodified(wExePathBuffer, &target->_lastModified);
+#endif
+
+	if(_filetime_is_newer(source->lastModified, target->_lastModified)) {
+#if OS == OS_WINDOWS
+		static _pathbuffer buildDirBuffer;
+		_pathbuffer        pathBuffer;
+		_wchar             wTmpExePathBuffer[MAX_PATH];
+		str                artifactPath;
+
+		_g_incremental       = false;
+		_g_targetsToBuild[0] = targetNameBuffer;
+		_g_targetsToBuild[1] = NONE;
+
+		buildConfiguration = Release;
+		_log_msg(_s("Recreating build program because the source has changed"), -1, NONE);
+
+		/*
+		 * Set build directory to _g_buildDir + ".tmp"
+		 */
+
+		buildDirBuffer.len = 0;
+		_check(_path_add_segment(_g_buildDir, &buildDirBuffer));
+		_check(_path_add_segment(_s(".tmp"), &buildDirBuffer));
+		_g_buildDir = _str(buildDirBuffer.data, buildDirBuffer.len);
+
+		_check(_create_directory(_g_buildDir, -1, NONE));
+
+		/*
+		 * Windows doesn't allow deleting the currently running executable but moving the file is fine.
+		 * It is moved to a file in the build directory with the .old extension so the compiler can create the new executable in place.
+		 */
+
+		pathBuffer.len = 0;
+		_check(_make_artifact_filepath(targetName, target->projectDir, target->type, &pathBuffer));
+		artifactPath = _str(pathBuffer.data, pathBuffer.len);
+		_check(_path_append_raw(_s(".old"), &pathBuffer));
+		_check(_win32_assemble_path(_str(pathBuffer.data, pathBuffer.len), wTmpExePathBuffer));
+
+		if(!MoveFileExW(wExePathBuffer, wTmpExePathBuffer, 0x1 | 0x8)) { /* MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH */
+			_log_err(_s("Failed to move to temporary file: "), -1, NONE);
+			_log_raw(_str(pathBuffer.data, pathBuffer.len));
+			return (int)GetLastError();
+		}
+#endif
+
+		_check(_build());
+
+#if OS == OS_WINDOWS
+		/*
+		 * After the build, move the newly created executable back to the old location.
+		 */
+
+		_check(_win32_assemble_path(artifactPath, wTmpExePathBuffer));
+
+		if(!MoveFileExW(wTmpExePathBuffer, wExePathBuffer, 0x1 | 0x8)) { /* MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH */
+			_log_err(_s("Failed to move build executable to final location"), -1, NONE);
+			return (int)GetLastError();
+		}
+#endif
+
+		*didRebuild = true;
+
+		/*
+		 * Relaunch build with the same args
+		 */
+		{
+			_cmdlinebuffer cmdLine;
+			int            i;
+			cmdLine.len = 0;
+
+			for(i = 0; i < argc; ++i)
+				_check(_cmdline_add_arg(_cstr(argv[i]), &cmdLine));
+
+			_check(_add_job(&cmdLine, _g_cwd, false));
+			_check(_wait_jobs());
+		}
+	} else {
+		*didRebuild = false;
+	}
+
+	--_g_targetCount;
+	--_g_sourceCount;
+
+	return 0;
+}
+
 /*
  * Project
  */
 
 #define begin_project(project_identifier) \
-	int _main(void) { \
+	int _main(int argc, char** argv) { \
 		_g_currentProjectDir = _path_without_file(_s(__FILE__)); \
+		do { \
+			_bool didRebuild = false; \
+			_check(_rebuild_if_needed(__FILE__, argc, argv, &didRebuild)); \
+			if(didRebuild) \
+				return 0; \
+		} while((void)0,0); \
 		do { \
 
 #define end_project \
@@ -2304,8 +2469,8 @@ static int _build(void) {
 
 #define add_project(project_identifier) \
 	do { \
-		int project_identifier ## _main(void); \
-		_check(project_identifier ## _main()); \
+		int project_identifier ## _main(int argc, char** argv); \
+		_check(project_identifier ## _main(argc, argv)); \
 	} while((void)0,0)
 
 #define project_directory(directory_name) \
@@ -2322,13 +2487,19 @@ static int _init(void) {
 	CmdLineToArgv CommandLineToArgvW = (CmdLineToArgv)GetProcAddress(shell32, "CommandLineToArgvW");
 	_wchar**      argvW              = CommandLineToArgvW(GetCommandLineW(), &_g_win32Argc);
 	int           bufferOffset       = 0;
-	SYSTEM_INFO   systemInfo         = {0};
+	SYSTEM_INFO   systemInfo;
 	int i;
 
+	mem_fill(&systemInfo, 0, sizeof(systemInfo));
 	GetSystemInfo(&systemInfo);
 
 	_g_maxJobs           = (int)systemInfo.dwNumberOfProcessors;
 	_g_win32StdoutHandle = GetStdHandle(0xfffffff5);
+
+	if(_g_win32Argc >= _array_count(_g_win32Argv)) {
+		_log_err(_s("Too many arguments"), -1, NONE);
+		return 1;
+	}
 
 	for(i = 0; i < _g_win32Argc; ++i)
 	{
@@ -2464,7 +2635,7 @@ static int _parse_args(int argc, char** argv) {
 	return 0;
 }
 
-int _main(void);
+int _main(int argc, char** argv);
 
 #ifdef NO_CRT
 int mainCRTStartup(void) {
@@ -2480,8 +2651,6 @@ int main(int argc, char** argv) {
 	if(exitCode == 0) {
 		_g_buildDir = _s(".build/");
 		exitCode    = _parse_args(argc, argv);
-#undef argc
-#undef argv
 
 		if(exitCode == 0) {
 			_log_msg(_s("Compiler: "), -1, NONE);
@@ -2505,11 +2674,13 @@ int main(int argc, char** argv) {
 				_log_raw(_s("unknown"));
 			}
 
-			exitCode = _main();
+			exitCode = _main(argc, argv);
 		}
 	}
 
 	_deinit_and_exit(exitCode);
+#undef argc
+#undef argv
 }
 
 /*
@@ -2554,7 +2725,9 @@ void* __cdecl memmove(void* dest, const void* src, unsigned long long size) {
 
 #undef begin_project
 #define begin_project(project_identifier) \
-	int project_identifier ## _main(void) { \
+	int project_identifier ## _main(int argc, char** argv) { \
+		(void)argc; \
+		(void)argv; \
 		_g_currentProjectDir = _path_without_file(_s(__FILE__)); \
 		do {
 

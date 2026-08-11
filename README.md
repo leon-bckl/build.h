@@ -24,6 +24,8 @@ end_project
 
 That's really all that's needed for a simple project. Just build the file with a compiler of your choice and run the resulting executable. E.g., `clang build.c -o build && ./build`
 
+Upon starting, the program automatically detects whether its source file has changed and rebuilds itself if that's the case. This makes it possible to add files, flags etc. without having to worry about rebuilding the project file manually each time.
+
 ## Command-line arguments
 
 The following arguments can be used when calling the compiled build system executable:
