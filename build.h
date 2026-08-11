@@ -238,6 +238,7 @@ struct _target {
 	_linkoptions    linkOpt;
 	_filetime       _lastModified;
 	_bool           _skipBuild;
+	_bool           _needsLink;
 	_bool           _isLinkTarget;
 	int             _linkDependencyCount;
 	Target          _linkDependencies[MAX_TARGET_DEPENDENCIES];
@@ -1592,7 +1593,7 @@ static int _cmdline_add_compile_options(const _source* source, const _compileopt
 	return 0;
 }
 
-static int _build_compiler_cmdline(const _source* source, _cmdlinebuffer* cmdLine) {
+static int _build_compiler_cmdline(const _source* source, str objFilePath, _cmdlinebuffer* cmdLine) {
 	_pathbuffer pathBuffer;
 	const str   compiler = _compiler_executable(source->kind);
 
@@ -1635,9 +1636,7 @@ static int _build_compiler_cmdline(const _source* source, _cmdlinebuffer* cmdLin
 	_check(_cmdline_add_arg(_s("-o"), cmdLine));
 #endif
 
-	pathBuffer.len = 0;
-	_check(_make_artifact_filepath(source->fileName, source->target->projectDir, ObjectFile, &pathBuffer));
-	_check(_cmdline_append_arg(_str(pathBuffer.data, pathBuffer.len), cmdLine));
+	_check(_cmdline_append_arg(objFilePath, cmdLine));
 
 	pathBuffer.len = 0;
 	_check(_assemble_source_path(source, &pathBuffer));
@@ -2169,16 +2168,22 @@ static _bool _filetime_is_newer(_filetime f1, _filetime f2) {
 	return false;
 }
 
-static int _add_compile_job(_source* source, str objFilePath) {
+static int _add_compile_job(_source* source) {
 	_cmdlinebuffer cmdLine;
+	_pathbuffer    pathBuffer;
 	_filetime      objLastModified;
+	str            objFilePath;
+
+	pathBuffer.len = 0;
+	_check(_make_artifact_filepath(source->fileName, source->target->projectDir, ObjectFile, &pathBuffer));
+	objFilePath = _str(pathBuffer.data, pathBuffer.len);
 
 	_get_lastmodified(objFilePath, &objLastModified);
 
 	if(_g_incremental && _filetime_is_newer(objLastModified, source->lastModified))
 		return 0;
 
-	_check(_build_compiler_cmdline(source, &cmdLine));
+	_check(_build_compiler_cmdline(source, objFilePath, &cmdLine));
 
 	if(_g_verbose)
 		_log_cmdline(&cmdLine);
@@ -2188,11 +2193,44 @@ static int _add_compile_job(_source* source, str objFilePath) {
 	_log_raw(_s("] "));
 	_log_raw(_file_without_path(source->fileName));
 
+	_check(_create_directory(_path_without_file(objFilePath), -1, NONE));
+
 	return _add_job(&cmdLine, source->target->projectDir, true);
 }
 
 static int _add_link_job(Target target) {
 	_cmdlinebuffer cmdLine;
+	_pathbuffer    pathBuffer;
+	int            i;
+
+	for(i = 0; i < target->_linkDependencyCount; ++i) {
+		if(target->_linkDependencies[i]->_needsLink) {
+			target->_needsLink = true;
+			break;
+		}
+	}
+
+	if(!target->_needsLink) {
+		for(i = 0; i < _g_sourceCount; ++i) {
+			_source*  source = &_g_sources[i];
+			_filetime lastModified;
+
+			if(source->target != target)
+				continue;
+
+			pathBuffer.len = 0;
+			_check(_make_artifact_filepath(source->fileName, target->projectDir, ObjectFile, &pathBuffer));
+			_get_lastmodified(_str(pathBuffer.data, pathBuffer.len), &lastModified);
+
+			if(_filetime_is_newer(lastModified, target->_lastModified)) {
+				target->_needsLink = true;
+				break;
+			}
+		}
+	}
+
+	if(!target->_needsLink)
+		return 0;
 
 	_check(_build_linker_cmdline(target, &cmdLine));
 
@@ -2236,7 +2274,6 @@ static void _sort_targets_by_link_order(Target* targets, int count) {
 }
 
 static int _build(void) {
-	_pathbuffer pathBuffer;
 	int         exitCode = 0;
 	int         i;
 
@@ -2269,18 +2306,11 @@ static int _build(void) {
 
 	for(i = 0; i < _g_sourceCount; ++i) {
 		_source*  source = &_g_sources[i];
-		str       objFilePath;
 
 		if(source->compiled || source->target->_skipBuild)
 			continue;
 
-		pathBuffer.len = 0;
-		_check(_make_artifact_filepath(source->fileName, source->target->projectDir, ObjectFile, &pathBuffer));
-		objFilePath = _str(pathBuffer.data, pathBuffer.len);
-
-		_check(_create_directory(_path_without_file(objFilePath), -1, NONE));
-
-		exitCode = _add_compile_job(source, objFilePath);
+		exitCode = _add_compile_job(source);
 
 		if(exitCode != 0) {
 			_wait_jobs();
@@ -2434,6 +2464,7 @@ static int _rebuild_if_needed(const char* srcFile, int argc, char** argv, _bool*
 			for(i = 0; i < argc; ++i)
 				_check(_cmdline_add_arg(_cstr(argv[i]), &cmdLine));
 
+			_log_raw(_s("\n"));
 			_check(_add_job(&cmdLine, _g_cwd, false));
 			_check(_wait_jobs());
 		}
