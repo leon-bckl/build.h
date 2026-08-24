@@ -1,8 +1,8 @@
 # build.h
 
-Building C and C++ projects often requires an external build system like CMake, Meson and many more. This unnecesssarily complicates the build when all that should really be needed is a compiler.
+Building C and C++ projects often requires an external build system like CMake, Meson and many more. This unnecessarily complicates the build when all that should really be needed is a compiler.
 
-This is where this single-header build system comes in. It lets you define your build targets and sources in C code that can be compiled into an executable with a simple comiler command. When run, the resulting program will automatically compile the project using the compiler that it was built with while managing toolchain-specific flags.
+This is where this single-header build system comes in. It lets you define your build targets and sources in C code that can be compiled into an executable with a simple compiler command. When run, the resulting program will automatically compile the project using the compiler that it was built with while managing toolchain-specific flags.
 
 This project is inspired by [nob.h](https://github.com/tsoding/nob.h) but aims to abstract away the raw compiler commands, making the build more portable across compilers and operating systems. It is written in C89 to maximize compatibility and has zero external dependencies.
 
@@ -30,13 +30,13 @@ Upon starting, the program automatically detects whether its source file has cha
 
 The following arguments can be used when calling the compiled build system executable:
 	
-- `-v` enables verbose output (e,g., printing compiler and linker command-lines).
+- `-v` enables verbose output (e.g., printing compiler and linker command-lines).
 - `-j<num>` defines the maximum number of parallel compilation jobs. The default is the number of cpu cores.
 - `--debug` disables optimization and generates debug information.
 - `--release` produces optimized binaries without debug information.
 - `--profiling` is the same as release but with debug information.
 - `-b<dirname>` specifies the build directory where the artifacts are created. By default it is `./.build`.
-- `--incremental` only compiles the source files that have changed by looking at their lastmodified timestamp and comparing it against the compiled object file. This does not consider changes in included headers yet.
+- `--incremental` only compiles the source files that have changed by looking at their last-modified timestamp and comparing it against the compiled object file. This does not consider changes in included headers yet.
 - `<target>` (without `-`) only builds the target with that name and its dependencies. Multiple targets can be specified.
 
 ## Targets
@@ -88,7 +88,7 @@ end_project
 
 Log output is written using `log_msg`, `log_err` and `log_raw`. `log_msg` and `log_err` always start on a new line. The latter adds the string `ERROR: ` in front of the message.
 
-`log_raw` is used to continue writing to the previous log line, allowing formatted log lines.
+`log_raw` is used to continue writing to the previous log line, allowing formatted log output.
 
 ```cpp
 log_msg("Hello World!");
