@@ -267,7 +267,7 @@ typedef struct {
  * Globals
  */
 
-_buildconfig           buildConfiguration = Debug;
+_buildconfig           _g_config = Debug;
 
 static const str       _emptyString = {NONE, 0};
 
@@ -504,14 +504,14 @@ _import _ulong _winapi GetLastError(void);
 
 _import void _winapi GetSystemInfo(SYSTEM_INFO* lpSystemInfo);
 
-_import int _winapi CloseHandle(void* hObject);
-_import int _winapi SetHandleInformation(void* hObject, _ulong dwMask, _ulong dwFlags);
+_import _bool _winapi CloseHandle(void* hObject);
+_import _bool _winapi SetHandleInformation(void* hObject, _ulong dwMask, _ulong dwFlags);
 
-_import int _winapi CreateProcessW(const _wchar* lpApplicationName, _wchar* lpCommandLine, void* lpProcessAttributes, void* lpThreadAttributes, int bInheritHandles, _ulong dwCreationFlags, void* lpEnvironment, const _wchar* lpCurrentDirectory, STARTUPINFOW* lpStartupInfo, PROCESS_INFORMATION* lpProcessInformation);
+_import _bool _winapi CreateProcessW(const _wchar* lpApplicationName, _wchar* lpCommandLine, void* lpProcessAttributes, void* lpThreadAttributes, int bInheritHandles, _ulong dwCreationFlags, void* lpEnvironment, const _wchar* lpCurrentDirectory, STARTUPINFOW* lpStartupInfo, PROCESS_INFORMATION* lpProcessInformation);
 _import _noreturn void _winapi ExitProcess (_uint uExitCode);
-_import int _winapi GetExitCodeProcess(void* hProcess, _ulong* lpExitCode);
+_import _bool _winapi GetExitCodeProcess(void* hProcess, _ulong* lpExitCode);
 
-_import int _winapi CreatePipe(void** hReadPipe, void** hWritePipe, SECURITY_ATTRIBUTES* lpPipeAttributes, _ulong nSize);
+_import _bool _winapi CreatePipe(void** hReadPipe, void** hWritePipe, SECURITY_ATTRIBUTES* lpPipeAttributes, _ulong nSize);
 
 _import void* _winapi LoadLibraryW(const _wchar* lpLibFileName);
 typedef void(_winapi*_farproc)(void);
@@ -523,15 +523,18 @@ _import _wchar* _winapi GetCommandLineW(void);
 _import _ulong _winapi GetCurrentDirectoryW(_ulong nBufferLength, _wchar* lpBuffer);
 
 _import _ulong _winapi GetFileAttributesW(const _wchar* lpFileName);
-_import int _winapi GetFileAttributesExW(const _wchar* lpFileName, GET_FILEEX_INFO_LEVELS fInfoLevelId, void* lpFileInformation);
+_import _bool _winapi GetFileAttributesExW(const _wchar* lpFileName, GET_FILEEX_INFO_LEVELS fInfoLevelId, void* lpFileInformation);
 
-_import int _winapi ReadFile(void* hFile, void* lpBuffer, _ulong nNumberOfBytesToRead, _ulong* lpNumberOfBytesRead, OVERLAPPED* lpOverlapped);
-_import int _winapi WriteFile(void* hFile, const void* lpBuffer, _ulong nNumberOfBytesToWrite, _ulong* lpNumberOfBytesWritten, void* lpOverlapped);
+_import _bool _winapi ReadFile(void* hFile, void* lpBuffer, _ulong nNumberOfBytesToRead, _ulong* lpNumberOfBytesRead, OVERLAPPED* lpOverlapped);
+_import _bool _winapi WriteFile(void* hFile, const void* lpBuffer, _ulong nNumberOfBytesToWrite, _ulong* lpNumberOfBytesWritten, void* lpOverlapped);
 
 _import _ulong _winapi GetModuleFileNameW(void* hModule, _wchar* lpFilename, _ulong nSize);
 
-_import int _winapi CreateDirectoryW(const _wchar* lpPathName, SECURITY_ATTRIBUTES* lpSecurityAttributes);
-_import int _winapi MoveFileExW(const _wchar* lpExistingFileName, const _wchar* lpNewFileName, _ulong dwFlags);
+_import _bool _winapi CreateDirectoryW(const _wchar* lpPathName, SECURITY_ATTRIBUTES* lpSecurityAttributes);
+
+_import _bool _winapi CopyFileW(const _wchar* lpExistingFileName, const _wchar* lpNewFileName, _bool bFailIfExists);
+_import _bool _winapi MoveFileExW(const _wchar* lpExistingFileName, const _wchar* lpNewFileName, _ulong dwFlags);
+_import _bool _winapi DeleteFileW(const _wchar* lpFileName);
 
 #define INFINITE    0xffffffff
 #define WAIT_FAILED 0xffffffff
@@ -2203,10 +2206,14 @@ static int _add_link_job(Target target) {
 	_pathbuffer    pathBuffer;
 	int            i;
 
-	for(i = 0; i < target->_linkDependencyCount; ++i) {
-		if(target->_linkDependencies[i]->_needsLink) {
-			target->_needsLink = true;
-			break;
+	target->_needsLink = !_g_incremental;
+
+	if(!target->_needsLink) {
+		for(i = 0; i < target->_linkDependencyCount; ++i) {
+			if(target->_linkDependencies[i]->_needsLink) {
+				target->_needsLink = true;
+				break;
+			}
 		}
 	}
 
@@ -2251,6 +2258,10 @@ static int _add_link_job(Target target) {
 /*
  * Build
  */
+
+static _buildconfig config(void) {
+	return _g_config;
+}
 
 static void _sort_targets_by_link_order(Target* targets, int count) {
 	int j;
@@ -2404,7 +2415,7 @@ static int _rebuild_if_needed(const char* srcFile, int argc, char** argv, _bool*
 		_g_targetsToBuild[0] = targetNameBuffer;
 		_g_targetsToBuild[1] = NONE;
 
-		buildConfiguration = Release;
+		_g_config = Release;
 		_log_msg(_s("Recreating build program because the source has changed"), -1, NONE);
 
 		/*
@@ -2461,8 +2472,15 @@ static int _rebuild_if_needed(const char* srcFile, int argc, char** argv, _bool*
 			int            i;
 			cmdLine.len = 0;
 
-			for(i = 0; i < argc; ++i)
-				_check(_cmdline_add_arg(_cstr(argv[i]), &cmdLine));
+			for(i = 0; i < argc; ++i) {
+				const str argStr = _cstr(argv[i]);
+
+				/* Project file has changed so don't do an incremental build even if it was requested */
+				if(_str_ieq(argStr, _s("--incremental")))
+					continue;
+
+				_check(_cmdline_add_arg(argStr, &cmdLine));
+			}
 
 			_log_raw(_s("\n"));
 			_check(_add_job(&cmdLine, _g_cwd, false));
@@ -2633,13 +2651,13 @@ static int _parse_args(int argc, char** argv) {
 					const str argStr = _cstr(arg);
 
 					if(_str_ieq(argStr, _s("--debug"))) {
-						buildConfiguration = Debug;
+						_g_config = Debug;
 						break;
 					} else if(_str_ieq(argStr, _s("--release"))) {
-						buildConfiguration = Release;
+						_g_config = Release;
 						break;
 					} else if(_str_ieq(argStr, _s("--profiling"))) {
-						buildConfiguration = Profiling;
+						_g_config = Profiling;
 						break;
 					} else if(_str_ieq(argStr, _s("--incremental"))) {
 						_g_incremental = true;
@@ -2689,7 +2707,7 @@ int main(int argc, char** argv) {
 
 			_log_msg(_s("Config: "), -1, NONE);
 
-			switch(buildConfiguration) {
+			switch(_g_config) {
 			case Debug:
 				_log_raw(_s("debug"));
 				_g_compileOptions.debugInformation = Enabled;
