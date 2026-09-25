@@ -233,6 +233,7 @@ typedef struct _target* Target;
 struct _target {
 	const char*     name;
 	str             projectDir;
+	str             installDir;
 	_artifact_type  type;
 	_compileoptions compileOpt;
 	_linkoptions    linkOpt;
@@ -272,9 +273,11 @@ _buildconfig           _g_config = Debug;
 static const str       _emptyString = {NONE, 0};
 
 static str             _g_buildDir;
+static str             _g_installDir;
 static str             _g_currentProjectDir;
 static _bool           _g_verbose     = false;
 static _bool           _g_incremental = false;
+static _bool           _g_install     = false;
 static int             _g_maxJobs     = 1;
 
 static char            _g_cwdBuffer[MAX_PATH];
@@ -1002,6 +1005,33 @@ error:
 }
 
 #define create_directory(path) _check(_create_directory(_cstr(path), __LINE__, __FILE__))
+
+static int _copy_file(str src, str dst, int line, const char* file) {
+#if OS == OS_WINDOWS
+	_wchar srcBuffer[MAX_PATH];
+	_wchar dstBuffer[MAX_PATH];
+
+	_check(_create_directory(_path_without_file(dst), -1, NONE));
+	_check(_win32_assemble_path(src, srcBuffer));
+	_check(_win32_assemble_path(dst, dstBuffer));
+
+	if(!CopyFileW(srcBuffer, dstBuffer, false))
+		goto error;
+#endif
+
+	return 0;
+
+error:
+	_log_err(_s("Failed to copy file '"), line, file);
+	_log_raw(src);
+	_log_raw(_s("' to '"));
+	_log_raw(dst);
+	_log_raw(_s("'"));
+
+	return 1;
+}
+
+#define copy_file(src, dst) _check(_copy_file(_cstr(src), _cstr(dst), __LINE__, __FILE__))
 
 /*
  * ParseList
@@ -2015,6 +2045,17 @@ static int _add_lib_paths_callback(str libPath, void* userData, int line, const 
 		_check(_parse_list(path_list, _add_lib_paths_callback, &_target->linkOpt._flags, __LINE__, __FILE__)); \
 	} while((void)0,0)
 
+#define install_directory(install_dir) \
+	_g_installDir = _cstr(install_dir)
+
+#define target_install_directory(target_or_target_name, install_dir) \
+	do { \
+		Target target = _get_target(target_or_target_name, __LINE__, __FILE__); \
+		if(target == NONE) \
+			return 1; \
+		target->installDir = _cstr(install_dir); \
+	} while((void)0,0)
+
 /*
  * Process creation
  */
@@ -2284,9 +2325,64 @@ static void _sort_targets_by_link_order(Target* targets, int count) {
 	}
 }
 
+static int _install(void) {
+	int i;
+
+	for(i = 0; i < _g_targetCount; ++i) {
+		const Target target = &_g_targets[i];
+		str          installDir;
+		_pathbuffer  artifactPathBuffer;
+		_pathbuffer  installPathBuffer;
+		int          pathLen;
+
+		if(target->_skipBuild)
+			continue;
+
+		installDir = target->installDir;
+
+		if(installDir.len == 0)
+			installDir = _g_installDir;
+
+		if(installDir.len == 0)
+			continue;
+
+		_log_msg(_s("Installing "), -1, NONE);
+		_log_raw(_cstr(target->name));
+		_log_raw(_s(" to "));
+		_log_raw(installDir);
+
+		installPathBuffer.len = 0;
+
+		if(!_path_is_abs(installDir))
+			_check(_path_add_segment(_path_without_file(target->projectDir), &installPathBuffer));
+
+		_check(_path_add_segment(installDir, &installPathBuffer));
+
+		artifactPathBuffer.len = 0;
+		_check(_make_artifact_filepath(_cstr(target->name), target->projectDir, target->type, &artifactPathBuffer));
+
+		pathLen = installPathBuffer.len;
+
+		_check(_path_append_raw(_file_without_path(_str(artifactPathBuffer.data, artifactPathBuffer.len)), &installPathBuffer));
+		_check(_copy_file(_str(artifactPathBuffer.data, artifactPathBuffer.len), _str(installPathBuffer.data, installPathBuffer.len), -1, NONE));
+
+		if(target->compileOpt.debugInformation == Enabled ||
+			(target->compileOpt.debugInformation == NotSet && _g_compileOptions.debugInformation == Enabled )) {
+			artifactPathBuffer.len = 0;
+			_check(_make_artifact_filepath(_cstr(target->name), target->projectDir, DebugInformation, &artifactPathBuffer));
+
+			installPathBuffer.len = pathLen;
+			_check(_path_append_raw(_file_without_path(_str(artifactPathBuffer.data, artifactPathBuffer.len)), &installPathBuffer));
+			_check(_copy_file(_str(artifactPathBuffer.data, artifactPathBuffer.len), _str(installPathBuffer.data, installPathBuffer.len), -1, NONE));
+		}
+	}
+
+	return 0;
+}
+
 static int _build(void) {
-	int         exitCode = 0;
-	int         i;
+	int exitCode = 0;
+	int i;
 
 	if(_g_targetsToBuild[0] != NONE) {
 		const char** nameIt;
@@ -2366,6 +2462,9 @@ static int _build(void) {
 			exitCode = _wait_jobs();
 	}
 
+	if(_g_install)
+		_check(_install());
+
 	return exitCode;
 }
 
@@ -2415,7 +2514,8 @@ static int _rebuild_if_needed(const char* srcFile, int argc, char** argv, _bool*
 		_g_targetsToBuild[0] = targetNameBuffer;
 		_g_targetsToBuild[1] = NONE;
 
-		_g_config = Release;
+		_g_config     = Release;
+		_g_installDir = _emptyString; /* Don't install */
 		_log_msg(_s("Recreating build program because the source has changed"), -1, NONE);
 
 		/*
@@ -2662,12 +2762,15 @@ static int _parse_args(int argc, char** argv) {
 					} else if(_str_ieq(argStr, _s("--incremental"))) {
 						_g_incremental = true;
 						break;
+					} else if(_str_ieq(argStr, _s("--install"))) {
+						_g_install = true;
+						break;
 					}
 				}
 				/* fallthrough */
 			default:
 				_log_err(_s("Unknown argument '"), -1, NONE);
-				_log_raw(_s(arg));
+				_log_raw(_cstr(arg));
 				_log_raw(_s("'"));
 				return 1;
 			}
