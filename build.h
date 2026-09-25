@@ -1324,9 +1324,9 @@ static Target _nextTarget(void){
 	_nextTarget(); \
 	_check(_add_target(target_name, target_type, source_list, __LINE__, __FILE__))
 
-#define add_executable(executable_name, source_list)  add_target(executable_name, Executable, source_list)
-#define add_static_library(library_name, source_list) add_target(library_name, StaticLibrary, source_list)
-#define add_shared_library(library_name, source_list) add_target(library_name, SharedLibrary, source_list)
+#define executable(executable_name, source_list)  add_target(executable_name, Executable, source_list)
+#define static_library(library_name, source_list) add_target(library_name, StaticLibrary, source_list)
+#define shared_library(library_name, source_list) add_target(library_name, SharedLibrary, source_list)
 
 /*
  * Executable names
@@ -2616,7 +2616,7 @@ static int _rebuild_if_needed(const char* srcFile, int argc, char** argv, _bool*
 		return _build(); \
 	}
 
-#define add_project(project_identifier) \
+#define include_project(project_identifier) \
 	do { \
 		int project_identifier ## _main(int argc, char** argv); \
 		_check(project_identifier ## _main(argc, argv)); \

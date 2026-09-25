@@ -18,7 +18,7 @@ Here's a simple project called 'Test' which builds an executable called 'MyProgr
 #include "build.h"
 
 begin_project(Test)
-	add_executable("MyProgram", "main.c");
+	executable("MyProgram", "main.c");
 end_project
 ```
 
@@ -43,17 +43,17 @@ The following arguments can be used when calling the compiled build system execu
 
 A target corresponds with an output binary like an executable or library. The target name defines the name of the binary file. Target names must be unique for the entire project and are case-insensitive.
 
-Targets are created using `add_executable`, `add_shared_library` and `add_static_library`. The first parameter is always the target name, followed by a list of source files which can also be `NONE` and then specified later using `target_sources`.
+Targets are created using `executable`, `shared_library` and `static_library`. The first parameter is always the target name, followed by a list of source files which can also be `NONE` and then specified later using `target_sources`.
 
 The commands that work with targets all have the form `target_*` and take a target or target name as the first parameter. Most of these commands have a non-target specific variant that applies to all targets like for example `target_include_paths` and `include_paths` or `target_defines` and `defines`.
 
 ```cpp
-add_executable("MyProgram", "main.c");
+executable("MyProgram", "main.c");
 target_defines("MyProgram", "FOO=1");
 
 /* Or alternatively using a target value instead of the name */
 
-Target myProgram = add_executable("MyProgram", "main.c");
+Target myProgram = executable("MyProgram", "main.c");
 target_defines(myProgram, "FOO=1");
 ```
 
@@ -72,13 +72,13 @@ defines("FOO,"
 
 ## Sub-projects
 
-It is possible to add projects defined in a separate source file. They need to either be compiled as their own translation unit or be included _after_ the main project. `add_project` is used to register the sub-project:
+It is possible to add projects defined in a separate source file. They need to either be compiled as their own translation unit or be included _after_ the main project. `include_project` is used to register the sub-project:
 
 ```cpp
 #include "build.h"
 
 begin_project(Main)
-	add_project(Other); /* Add the targets defined in the 'Other' project */
+	include_project(Other); /* Add the targets defined in the 'Other' project */
 end_project
 
 #include "other.c" /* Defines a project called 'Other'. Needs to also include build.h */
