@@ -84,6 +84,32 @@ end_project
 #include "other.c" /* Defines a project called 'Other'. Needs to also include build.h */
 ```
 
+## Conditional Compilation
+
+build.h defines platform-specific macros which can be used to control the build. Only the macro for the active platform is defined so it can be checked with `#ifdef`.
+
+Operating system defines:
+- _OS_MACOS_
+- _OS_WINDOWS_
+- _OS_LINUX_
+
+Compiler defines:
+- _COMPILER_CLANG_
+- _COMPILER_GCC_
+- _COMPILER_MSVC_
+
+Processor architecture defines:
+- _ARCH_X86_
+- _ARCH_X86_64_
+- _ARCH_ARM64_
+
+Usage:
+```cpp
+#ifdef COMPILER_MSVC
+  compile_flags("/utf8");
+#endif
+```
+
 ## Logging
 
 Log output is written using `log_msg`, `log_err` and `log_raw`. `log_msg` and `log_err` always start on a new line. The latter adds the string `ERROR: ` in front of the message.

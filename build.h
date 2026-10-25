@@ -5,16 +5,12 @@
  * Platform detection
  */
 
-#define OS_MACOS   1
-#define OS_WINDOWS 2
-#define OS_LINUX   3
-
 #ifdef __APPLE__
-	#define OS OS_MACOS
+	#define OS_MACOS
 #elif defined(_WIN32)
-	#define OS OS_WINDOWS
+	#define OS_WINDOWS
 #elif defined(__linux__)
-	#define OS OS_LINUX
+	#define OS_LINUX
 #else
 	#error "Unsupported os"
 #endif
@@ -23,16 +19,12 @@
  * Compiler detection
  */
 
-#define COMPILER_CLANG 1
-#define COMPILER_MSVC  2
-#define COMPILER_GCC   3
-
 #ifdef __clang__
-	#define COMPILER COMPILER_CLANG
+	#define COMPILER_CLANG
 #elif defined(_MSC_VER)
-	#define COMPILER COMPILER_MSVC
+	#define COMPILER_MSVC
 #elif defined(__GNUC__)
-	#define COMPILER COMPILER_GCC
+	#define COMPILER_GCC
 #else
 	#error "Unsupported compiler"
 #endif
@@ -41,20 +33,16 @@
  * Architecture detection
  */
 
-#define ARCH_X86    1
-#define ARCH_X86_64 2
-#define ARCH_ARM64  3
-
 #if defined(_M_IX86) || defined(__i386__)
-	#define ARCH         ARCH_X86
+	#define ARCH_X86
 	#define POINTER_SIZE 4
 	#define MAX_ALIGN    8
 #elif defined(_M_X64) || defined(__amd64__)
-	#define ARCH         ARCH_X86_64
+	#define ARCH_X86_64
 	#define POINTER_SIZE 8
 	#define MAX_ALIGN    16
 #elif defined(__aarch64__)
-	#define ARCH         ARCH_ARM64
+	#define ARCH_ARM64
 	#define POINTER_SIZE 8
 	#define MAX_ALIGN    16
 #else
@@ -89,7 +77,7 @@
 			return _exitCode; \
 	} while((void)0,0)
 
-#if COMPILER == COMPILER_MSVC
+#ifdef COMPILER_MSVC
 	#define _noreturn __declspec(noreturn)
 #else
 	#define _noreturn __attribute__((noreturn))
@@ -161,7 +149,7 @@ typedef enum {
 } _buildconfig;
 
 typedef struct {
-#if OS != OS_WINDOWS
+#ifdef OS_WINDOWS
 	int   argc;
 	char* argv[MAX_ARGS + 1];
 #endif
@@ -298,7 +286,7 @@ static char            _g_logBuffer[512];
 static int             _g_logBufferLen = 0;
 static _bool           _g_logAtNewline = true;
 
-#if OS == OS_WINDOWS
+#ifdef OS_WINDOWS
 static void*  _g_win32StdoutHandle = NONE;
 static int    _g_win32Argc         = 0;
 static char*  _g_win32Argv[128];
@@ -314,10 +302,10 @@ static void*  _g_win32ProcessStdOut[MAX_JOBS + 1]; /* +1 so the last entry is al
  * Ignore warnings
  */
 
-#if COMPILER == COMPILER_MSVC
+#ifdef COMPILER_MSVC
 	#pragma warning(disable: 4210) /* nonstandard extension used : function given file scope */
 	#pragma warning(push)
-#elif COMPILER == COMPILER_GCC || COMPILER == COMPILER_CLANG
+#elif defined(COMPILER_GCC) || defined(COMPILER_CLANG)
 	#pragma GCC diagnostic push
 	#pragma GCC diagnostic ignored "-Wcast-function-type" /* GetProcAddress return value */
 	#pragma GCC diagnostic ignored "-Wunused-function"
@@ -393,7 +381,7 @@ static _bool ascii_isspace(int c) {
 
 static _bool is_pathsep(int c) {
 	return c == '/'
-#if OS == OS_WINDOWS
+#ifdef OS_WINDOWS
 		|| c == '\\'
 #endif
 	;
@@ -404,7 +392,7 @@ static _bool is_pathsep(int c) {
  * win32
  */
 
-#if OS == OS_WINDOWS
+#ifdef OS_WINDOWS
 
 #if MAX_PATH > 260
 	#error "MAX_PATH must not be larger than 260 on windows"
@@ -417,7 +405,7 @@ static _bool is_pathsep(int c) {
 #define _import __declspec(dllimport)
 #define _winapi __stdcall
 
-#if defined(NO_CRT) && COMPILER == COMPILER_MSVC
+#if defined(NO_CRT) && defined(COMPILER_MSVC)
 	#pragma comment(lib, "kernel32.lib")
 #endif
 
@@ -796,7 +784,7 @@ static int _path_add_segment(str s, _pathbuffer* buffer) {
 }
 
 static _bool _path_is_abs(str path) {
-#if OS == OS_WINDOWS
+#ifdef OS_WINDOWS
 	return path.len >= 2 && ascii_isalpha(path.data[0]) && path.data[1] == ':';
 #else
 	return path.len > 0 && path.data[0] == '/';
@@ -902,7 +890,7 @@ static str _file_ext(str fileName) {
 
 static void log_flush(void) {
 	if(_g_logBufferLen > 0) {
-#if OS == OS_WINDOWS
+#ifdef OS_WINDOWS
 		_ulong numWritten;
 		WriteFile(_g_win32StdoutHandle, _g_logBuffer, (_ulong)_g_logBufferLen, &numWritten, NONE);
 #endif
@@ -967,7 +955,7 @@ static void _log_err(str msg, int line, const char* file) {
  */
 
 static int _create_directory(str path, int line, const char* file) {
-#if OS == OS_WINDOWS
+#ifdef OS_WINDOWS
 	_wchar  pathBuffer[MAX_PATH];
 	_wchar* p;
 
@@ -1007,7 +995,7 @@ error:
 #define create_directory(path) _check(_create_directory(_cstr(path), __LINE__, __FILE__))
 
 static int _copy_file(str src, str dst, int line, const char* file) {
-#if OS == OS_WINDOWS
+#ifdef OS_WINDOWS
 	_wchar srcBuffer[MAX_PATH];
 	_wchar dstBuffer[MAX_PATH];
 
@@ -1121,7 +1109,7 @@ static Target _get_target(const void* targetOrTargetName, int line, const char* 
 }
 
 static void _get_lastmodified(str filePath, _filetime* fileTime) {
-#if OS == OS_WINDOWS
+#ifdef OS_WINDOWS
 	_wchar wPath[MAX_PATH];
 	_win32_assemble_path(filePath, wPath);
 	_win32_get_lastmodified(wPath, fileTime);
@@ -1163,7 +1151,7 @@ static int _target_source_callback(str fileName, void* userData, int line, const
 	          _str_ieq(fileExt, _s(".mm"))) {
 		source->kind = CppSrc;
 	} else if(_str_ieq(fileExt, _s(".rc"))) {
-#if OS == OS_WINDOWS
+#ifdef OS_WINDOWS
 		source->kind = RcSrc;
 #else
 		return 0;
@@ -1228,31 +1216,31 @@ static str _rel_build_path(str path) {
 static str _artifact_file_ext(_artifact_type artifactType) {
 	switch(artifactType) {
 	case ObjectFile:
-#if COMPILER == COMPILER_MSVC
+#ifdef COMPILER_MSVC
 		return _s(".obj");
 #else
 		return _s(".o");
 #endif
 	case DebugInformation:
-#if OS == OS_WINDOWS
+#ifdef OS_WINDOWS
 		return _s(".pdb");
 #else
 		return _emptyString;
 #endif
 	case Executable:
-#if OS == OS_WINDOWS
+#ifdef OS_WINDOWS
 		return _s(".exe");
 #else
 		return _emptyString;
 #endif
 	case StaticLibrary:
-#if COMPILER == COMPILER_MSVC
+#ifdef COMPILER_MSVC
 		return _s(".lib");
 #else
 		return _s(".a");
 #endif
 	case SharedLibrary:
-#if OS == OS_WINDOWS
+#ifdef OS_WINDOWS
 		return _s(".dll");
 #elif OS == OS_MACOS
 		return _s(".dylib");
@@ -1335,32 +1323,32 @@ static Target _nextTarget(void){
 static str _compiler_executable(_sourcekind sourceKind) {
 	switch(sourceKind) {
 	case CSrc:
-#if COMPILER == COMPILER_MSVC
+#ifdef COMPILER_MSVC
 		return _s("cl");
-#elif COMPILER == COMPILER_CLANG
+#elif defined(COMPILER_CLANG)
 		return _s("clang");
-#elif COMPILER == COMPILER_GCC
+#elif defined(COMPILER_GCC)
 		return _s("gcc");
 #else
 	#error "Unsupported C compiler"
 #endif
 	case CppSrc:
-#if COMPILER == COMPILER_MSVC
+#ifdef COMPILER_MSVC
 		return _s("cl");
-#elif COMPILER == COMPILER_CLANG
+#elif defined(COMPILER_CLANG)
 		return _s("clang++");
-#elif COMPILER == COMPILER_GCC
+#elif defined(COMPILER_GCC)
 		return _s("g++");
 #else
 	#error "Unsupported C++ compiler"
 #endif
-#if OS == OS_WINDOWS
+#ifdef OS_WINDOWS
 	case RcSrc:
-#if COMPILER == COMPILER_MSVC
+#ifdef COMPILER_MSVC
 		return _s("rc");
-#elif COMPILER == COMPILER_CLANG
+#elif defined(COMPILER_CLANG)
 		return _s("llvm-rc");
-#elif COMPILER == COMPILER_GCC
+#elif defined(COMPILER_GCC)
 		return _s("windres");
 #else
 	#error "Unsupported resource compiler"
@@ -1373,14 +1361,14 @@ static str _compiler_executable(_sourcekind sourceKind) {
 
 static str _linker_executable(_artifact_type artifactType) {
 	(void)artifactType;
-#if COMPILER == COMPILER_MSVC
+#ifdef COMPILER_MSVC
 	if(artifactType == StaticLibrary)
 		return _s("lib");
 
 	return _s("link");
-#elif COMPILER == COMPILER_CLANG
+#elif defined(COMPILER_CLANG)
 	return _s("clang");
-#elif COMPILER == COMPILER_GCC
+#elif defined(COMPILER_GCC)
 	return _s("gcc");
 #else
 	#error "Unsupported linker"
@@ -1392,7 +1380,7 @@ static str _linker_executable(_artifact_type artifactType) {
  */
 
 static void _log_cmdline(const _cmdlinebuffer* cmdLine) {
-#if OS == OS_WINDOWS
+#ifdef OS_WINDOWS
 	_log_msg(_str(cmdLine->buffer, cmdLine->len), -1, NONE);
 #else
 	int i;
@@ -1405,7 +1393,7 @@ static void _log_cmdline(const _cmdlinebuffer* cmdLine) {
 }
 
 static int _cmdline_arg_push(str s, _cmdlinebuffer* cmdLine, int append) {
-#if OS == OS_WINDOWS
+#ifdef OS_WINDOWS
 	int needsEscape = s.len == 0 && !append; /* Escape empty arguments so they are not lost */
 #endif
 	int i;
@@ -1416,7 +1404,7 @@ static int _cmdline_arg_push(str s, _cmdlinebuffer* cmdLine, int append) {
 	if(cmdLine->len + s.len >= MAX_COMMAND_LINE)
 		goto too_long;
 
-#if OS == OS_WINDOWS
+#ifdef OS_WINDOWS
 	for(i = 0; i < s.len; ++i) {
 		if(ascii_isspace(s.data[i]) || s.data[i] == '\\' || s.data[i] == ',') {
 			needsEscape = 1;
@@ -1482,7 +1470,7 @@ static int _cmdline_arg_push(str s, _cmdlinebuffer* cmdLine, int append) {
 	if(cmdLine->len >= MAX_COMMAND_LINE)
 		goto too_long;
 
-#if OS == OS_WINDOWS
+#ifdef OS_WINDOWS
 	if(cmdLine->len < MAX_COMMAND_LINE) {
 		cmdLine->buffer[cmdLine->len] = ' ';
 		++cmdLine->len;
@@ -1504,7 +1492,7 @@ too_long:
 #define _cmdline_append_arg(arg, cmd_line) _cmdline_arg_push((arg), (cmd_line), 1)
 
 static int _cmdline_combine(_cmdlinebuffer* cmdLine, const _cmdlinebuffer* other) {
-#if OS == OS_WINDOWS
+#ifdef OS_WINDOWS
 	if(cmdLine->len + other->len > MAX_COMMAND_LINE) {
 		log_err("Command line too long, define MAX_COMMAND_LINE to increase limit (" _stringify(MAX_COMMAND_LINE) ")");
 		return 1;
@@ -1527,7 +1515,7 @@ static int _cmdline_add_compile_options(const _source* source, const _compileopt
 	const _optimizationlevel  optimizations = overrides->optimizations != OptimizeDefault ? overrides->optimizations : defaults->optimizations;
 	const _tristate           debugInfo     = overrides->debugInformation != NotSet ? overrides->debugInformation : defaults->debugInformation;
 
-#if COMPILER == COMPILER_MSVC
+#ifdef COMPILER_MSVC
 	#define _stdopt "/std:"
 #else
 	#define _stdopt "-std="
@@ -1535,7 +1523,7 @@ static int _cmdline_add_compile_options(const _source* source, const _compileopt
 
 	if(source->kind == CSrc) {
 		switch(cVersion) {
-#if COMPILER != COMPILER_MSVC
+#ifndef COMPILER_MSVC
 		case C89:
 			_check(_cmdline_add_arg(_s(_stdopt"c89"), cmdLine));
 			break;
@@ -1584,13 +1572,13 @@ static int _cmdline_add_compile_options(const _source* source, const _compileopt
 #undef _stdopt
 
 	if(optimizations == OptimizeNone) {
-#if COMPILER == COMPILER_MSVC
+#ifdef COMPILER_MSVC
 		_check(_cmdline_add_arg(_s("/Od"), cmdLine));
 #else
 		_check(_cmdline_add_arg(_s("-O0"), cmdLine));
 #endif
 	} else if(optimizations == OptimizeNone) {
-#if COMPILER == COMPILER_MSVC
+#ifdef COMPILER_MSVC
 		_check(_cmdline_add_arg(_s("/O2"), cmdLine));
 #else
 		_check(_cmdline_add_arg(_s("-O2"), cmdLine));
@@ -1598,7 +1586,7 @@ static int _cmdline_add_compile_options(const _source* source, const _compileopt
 	}
 
 	if(debugInfo == Enabled) {
-#if COMPILER == COMPILER_MSVC
+#ifdef COMPILER_MSVC
 		if(source->target->type == StaticLibrary) {
 			_check(_cmdline_add_arg(_s("/Z7"), cmdLine));
 		} else {
@@ -1642,13 +1630,13 @@ static int _build_compiler_cmdline(const _source* source, str objFilePath, _cmdl
 
 	_check(_cmdline_add_arg(compiler, cmdLine));
 
-#if COMPILER == COMPILER_MSVC
+#ifdef COMPILER_MSVC
 	if(source->kind != RcSrc) /* Later versions of rc do support /nologo but better be safe and not use it */
 		_check(_cmdline_add_arg(_s("/nologo"), cmdLine));
 #endif
 
 	if(source->kind != RcSrc) {
-#if COMPILER == COMPILER_MSVC
+#ifdef COMPILER_MSVC
 		_check(_cmdline_add_arg(_s("/c"), cmdLine));
 #else
 		_check(_cmdline_add_arg(_s("-c"), cmdLine));
@@ -1658,10 +1646,10 @@ static int _build_compiler_cmdline(const _source* source, str objFilePath, _cmdl
 	if(source->kind != RcSrc) /* TODO: Separate include paths and defines and pass them to rc */
 		_check(_cmdline_add_compile_options(source, &_g_compileOptions, &source->target->compileOpt, cmdLine));
 
-#if COMPILER == COMPILER_MSVC
+#ifdef COMPILER_MSVC
 	_check(_cmdline_add_arg(_s("/Fo"), cmdLine));
 #else
-	#if COMPILER == COMPILER_CLANG
+	#ifdef COMPILER_CLANG
 	if(source->kind == RcSrc)
 		_check(_cmdline_add_arg(_s("/Fo"), cmdLine)); /* llvm-rc uses /Fo like msvc rc */
 	else
@@ -1699,7 +1687,7 @@ static int _build_linker_cmdline(Target target, _cmdlinebuffer* cmdLine) {
 
 	_check(_cmdline_add_arg(linker, cmdLine));
 
-#if COMPILER == COMPILER_MSVC
+#ifdef COMPILER_MSVC
 	_check(_cmdline_add_arg(_s("/NOLOGO"), cmdLine));
 
 	if(target->type != StaticLibrary)
@@ -1707,13 +1695,13 @@ static int _build_linker_cmdline(Target target, _cmdlinebuffer* cmdLine) {
 #endif
 
 	if(target->type == SharedLibrary) {
-#if COMPILER == COMPILER_MSVC
+#ifdef COMPILER_MSVC
 		_check(_cmdline_add_arg(_s("/DLL"), cmdLine));
 #else
 		_check(_cmdline_add_arg(_s("--shared"), cmdLine));
 #endif
 	} else if(target->type == StaticLibrary) {
-#if COMPILER != COMPILER_MSVC
+#ifdef COMPILER_MSVC
 		_check(_cmdline_add_arg(_s("--static"), cmdLine));
 #endif
 	}
@@ -1722,7 +1710,7 @@ static int _build_linker_cmdline(Target target, _cmdlinebuffer* cmdLine) {
 
 	if(target->compileOpt.debugInformation == Enabled ||
 	   (target->compileOpt.debugInformation == NotSet && _g_compileOptions.debugInformation == Enabled )) {
-#if COMPILER == COMPILER_MSVC
+#ifdef COMPILER_MSVC
 		if(target->type != StaticLibrary) {
 			_check(_cmdline_add_arg(_s("/DEBUG:FULL"), cmdLine));
 			_check(_cmdline_add_arg(_s("/PDB:"), cmdLine));
@@ -1734,7 +1722,7 @@ static int _build_linker_cmdline(Target target, _cmdlinebuffer* cmdLine) {
 #endif
 	}
 
-#if COMPILER == COMPILER_MSVC
+#ifdef COMPILER_MSVC
 	_check(_cmdline_add_arg(_s("/OUT:"), cmdLine));
 #else
 	_check(_cmdline_add_arg(_s("-o"), cmdLine));
@@ -1818,7 +1806,7 @@ static int _add_include_paths_callback(str includePath, void* userData, int line
 	(void)line;
 	(void)file;
 
-#if COMPILER == COMPILER_MSVC
+#ifdef COMPILER_MSVC
 	_check(_cmdline_add_arg(_s("/I"), cmdLine));
 #else
 	_check(_cmdline_add_arg(_s("-I"), cmdLine));
@@ -1853,7 +1841,7 @@ static int _add_defines_callback(str defineStr, void* userData, int line, const 
 	(void)line;
 	(void)file;
 
-#if COMPILER == COMPILER_MSVC
+#ifdef COMPILER_MSVC
 	_check(_cmdline_add_arg(_s("/D"), cmdLine));
 #else
 	_check(_cmdline_add_arg(_s("-D"), cmdLine));
@@ -1892,7 +1880,7 @@ static int _add_defines_callback(str defineStr, void* userData, int line, const 
 
 static int _target_lib_path(str libPath, _cmdlinebuffer* cmdLine) {
 	if(libPath.len >= 0) {
-#if COMPILER == COMPILER_MSVC
+#ifdef COMPILER_MSVC
 		_check(_cmdline_add_arg(_s("/LIBPATH:"), cmdLine));
 #else
 		_check(_cmdline_add_arg(_s("-L"), cmdLine));
@@ -1914,7 +1902,7 @@ static int _target_lib_path(str libPath, _cmdlinebuffer* cmdLine) {
 
 static int _target_link_lib(str libName, _cmdlinebuffer* cmdLine) {
 	if(libName.len > 0) {
-#if COMPILER == COMPILER_MSVC
+#ifdef COMPILER_MSVC
 		_check(_cmdline_add_arg(libName, cmdLine));
 
 		if(_file_ext(libName).len == 0)
@@ -2061,7 +2049,7 @@ static int _add_lib_paths_callback(str libPath, void* userData, int line, const 
  */
 
 static void _log_job_output(int jobIdx, _bool logError) {
-#if OS == OS_WINDOWS
+#ifdef OS_WINDOWS
 	char   buffer[512];
 	_ulong bytesRead    = 0;
 	void*  outputHandle = _g_win32ProcessStdOut[jobIdx];
@@ -2112,7 +2100,7 @@ static int _wait_jobs(void) {
 }
 
 static int _add_job(const _cmdlinebuffer* cmdLine, str workingDir, _bool redirectOutput) {
-#if OS == OS_WINDOWS
+#ifdef OS_WINDOWS
 	_wchar              workingDirBuffer[MAX_PATH];
 	_wchar              cmdLineBuffer[MAX_COMMAND_LINE + 1];
 	const int           workingDirLen = MultiByteToWideChar(CP_UTF8, 0, workingDir.data, workingDir.len, workingDirBuffer, MAX_PATH);
@@ -2473,7 +2461,7 @@ static int _rebuild_if_needed(const char* srcFile, int argc, char** argv, _bool*
 	Target      target;
 	_source*    source;
 	str         targetName = _file_without_path(_file_basename(_cstr(srcFile)));
-#if OS == OS_WINDOWS
+#ifdef OS_WINDOWS
 	_wchar      wExePathBuffer[MAX_PATH];
 #endif
 
@@ -2494,7 +2482,7 @@ static int _rebuild_if_needed(const char* srcFile, int argc, char** argv, _bool*
 	 * Get lastmodified timestamp from actual executable file which might not be the same as the target.
 	 */
 
-#if OS == OS_WINDOWS
+#ifdef OS_WINDOWS
 	if(GetModuleFileNameW(NONE, wExePathBuffer, _array_count(wExePathBuffer)) == 0) {
 		_log_err(_s("GetModuleFileNameW failed"), -1, NONE);
 		return (int)GetLastError();
@@ -2504,7 +2492,7 @@ static int _rebuild_if_needed(const char* srcFile, int argc, char** argv, _bool*
 #endif
 
 	if(_filetime_is_newer(source->lastModified, target->_lastModified)) {
-#if OS == OS_WINDOWS
+#ifdef OS_WINDOWS
 		static _pathbuffer buildDirBuffer;
 		_pathbuffer        pathBuffer;
 		_wchar             wTmpExePathBuffer[MAX_PATH];
@@ -2549,7 +2537,7 @@ static int _rebuild_if_needed(const char* srcFile, int argc, char** argv, _bool*
 
 		_check(_build());
 
-#if OS == OS_WINDOWS
+#ifdef OS_WINDOWS
 		/*
 		 * After the build, move the newly created executable back to the old location.
 		 */
@@ -2630,7 +2618,7 @@ static int _rebuild_if_needed(const char* srcFile, int argc, char** argv, _bool*
  */
 
 static int _init(void) {
-#if OS == OS_WINDOWS
+#ifdef OS_WINDOWS
 	typedef _wchar**(_winapi*CmdLineToArgv)(const _wchar*, int*);
 	void*         shell32            = LoadLibraryW(L"Shell32.dll");
 	CmdLineToArgv CommandLineToArgvW = (CmdLineToArgv)GetProcAddress(shell32, "CommandLineToArgvW");
@@ -2677,7 +2665,7 @@ static _noreturn void _deinit_and_exit(int exitCode) {
 		_log_raw(_s("\n"));
 
 	log_flush();
-#if OS == OS_WINDOWS
+#ifdef OS_WINDOWS
 	ExitProcess((_uint)exitCode);
 #endif
 }
@@ -2863,9 +2851,9 @@ void* __cdecl memmove(void* dest, const void* src, unsigned long long size) {
 }
 #endif
 
-#if COMPILER == COMPILER_MSVC
+#ifdef COMPILER_MSVC
 	#pragma warning(pop)
-#elif COMPILER == COMPILER_GCC || COMPILER == COMPILER_CLANG
+#elif defined(COMPILER_GCC) || defined(COMPILER_CLANG)
 	#pragma GCC diagnostic pop
 #endif
 
