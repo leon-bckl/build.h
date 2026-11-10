@@ -496,13 +496,15 @@ _import _ulong _winapi GetLastError(void);
 _import void _winapi GetSystemInfo(SYSTEM_INFO* lpSystemInfo);
 
 _import _bool _winapi CloseHandle(void* hObject);
-_import _bool _winapi SetHandleInformation(void* hObject, _ulong dwMask, _ulong dwFlags);
 
 _import _bool _winapi CreateProcessW(const _wchar* lpApplicationName, _wchar* lpCommandLine, void* lpProcessAttributes, void* lpThreadAttributes, int bInheritHandles, _ulong dwCreationFlags, void* lpEnvironment, const _wchar* lpCurrentDirectory, STARTUPINFOW* lpStartupInfo, PROCESS_INFORMATION* lpProcessInformation);
 _import _noreturn void _winapi ExitProcess (_uint uExitCode);
 _import _bool _winapi GetExitCodeProcess(void* hProcess, _ulong* lpExitCode);
 
-_import _bool _winapi CreatePipe(void** hReadPipe, void** hWritePipe, SECURITY_ATTRIBUTES* lpPipeAttributes, _ulong nSize);
+_import void*  _winapi CreateFileW(const _wchar* lpFileName, _ulong dwDesiredAccess, _ulong dwShareMode, SECURITY_ATTRIBUTES* lpSecurityAttributes, _ulong dwCreationDisposition, _ulong dwFlagsAndAttributes, void* hTemplateFile);
+_import _ulong _winapi SetFilePointer(void* hFile, long lDistanceToMove, long* lpDistanceToMoveHigh, _ulong dwMoveMethod);
+_import _ulong _winapi GetTempPathW(_ulong nBufferLength, _wchar* lpBuffer);
+_import _uint  _winapi GetTempFileNameW(const _wchar* lpPathName, const _wchar* lpPrefixString, _uint uUnique, _wchar* lpTempFileName);
 
 _import void* _winapi LoadLibraryW(const _wchar* lpLibFileName);
 typedef void(_winapi*_farproc)(void);
@@ -529,6 +531,7 @@ _import _bool _winapi DeleteFileW(const _wchar* lpFileName);
 
 #define INFINITE    0xffffffff
 #define WAIT_FAILED 0xffffffff
+#define INVALID_HANDLE_VALUE ((void*)-1)
 
 _import _ulong _winapi WaitForSingleObject(void* hHandle, _ulong dwMilliseconds);
 _import _ulong _winapi WaitForMultipleObjects(_ulong nCount, void* const* lpHandles, int bWaitAll, _ulong dwMilliseconds);
@@ -638,7 +641,18 @@ static _bool _str_ieq(str s1, str s2) {
 }
 
 static _bool str_ieq(const char* s1, const char* s2) {
-	return _str_eq(_cstr(s1), _cstr(s2));
+	return _str_ieq(_cstr(s1), _cstr(s2));
+}
+
+static _bool _str_contains(str s, str sub) {
+	int i;
+
+	for(i = 0; i + sub.len <= s.len; ++i) {
+		if(_str_eq(_str(s.data + i, sub.len), sub))
+			return 1;
+	}
+
+	return 0;
 }
 
 static str _str_left(str s, int count) {
@@ -1512,8 +1526,11 @@ static int _cmdline_combine(_cmdlinebuffer* cmdLine, const _cmdlinebuffer* other
 static int _cmdline_add_compile_options(const _source* source, const _compileoptions* defaults, const _compileoptions* overrides, _cmdlinebuffer* cmdLine) {
 	const _clanguageversion   cVersion      = overrides->cVersion != CDefault ? overrides->cVersion : defaults->cVersion;
 	const _cpplanguageversion cppVersion    = overrides->cppVersion != CppDefault ? overrides->cppVersion : defaults->cppVersion;
-	const _optimizationlevel  optimizations = overrides->optimizations != OptimizeDefault ? overrides->optimizations : defaults->optimizations;
+	_optimizationlevel        optimizations = overrides->optimizations != OptimizeDefault ? overrides->optimizations : defaults->optimizations;
 	const _tristate           debugInfo     = overrides->debugInformation != NotSet ? overrides->debugInformation : defaults->debugInformation;
+
+	if(optimizations == OptimizeDefault)
+		optimizations = _g_config == Debug ? OptimizeNone : OptimizeSpeed;
 
 #ifdef COMPILER_MSVC
 	#define _stdopt "/std:"
@@ -1577,7 +1594,7 @@ static int _cmdline_add_compile_options(const _source* source, const _compileopt
 #else
 		_check(_cmdline_add_arg(_s("-O0"), cmdLine));
 #endif
-	} else if(optimizations == OptimizeNone) {
+	} else if(optimizations == OptimizeSpeed) {
 #ifdef COMPILER_MSVC
 		_check(_cmdline_add_arg(_s("/O2"), cmdLine));
 #else
@@ -1891,6 +1908,7 @@ static int _target_lib_path(str libPath, _cmdlinebuffer* cmdLine) {
 				_check(_cmdline_append_arg(_g_cwd, cmdLine));
 
 			_check(_cmdline_append_arg(_g_currentProjectDir, cmdLine));
+			_check(_cmdline_append_arg(_s("/"), cmdLine));
 			_check(_cmdline_append_arg(libPath, cmdLine));
 		} else {
 			_check(_cmdline_append_arg(libPath, cmdLine));
@@ -2010,7 +2028,7 @@ static int _add_libs_callback(str lib, void* userData, int line, const char* fil
 		if(_is_target_ptr(library_list_or_target)) \
 			_check(_target_link(target, (Target)library_list_or_target, __LINE__, __FILE__)); \
 		else \
-			_check(_parse_list(library_list_or_target, _add_libs_callback, target, __LINE__, __FILE__)); \
+			_check(_parse_list((const char*)library_list_or_target, _add_libs_callback, target, __LINE__, __FILE__)); \
 	} while((void)0,0)
 
 static int _add_lib_paths_callback(str libPath, void* userData, int line, const char* file) {
@@ -2048,22 +2066,47 @@ static int _add_lib_paths_callback(str libPath, void* userData, int line, const 
  * Process creation
  */
 
+#ifdef OS_WINDOWS
+static _bool _job_output_has_diagnostics(void* outputHandle) {
+	static char buffer[0x10000];
+	_ulong      bytesRead = 0;
+
+	SetFilePointer(outputHandle, 0, NONE, 0); /* FILE_BEGIN */
+
+	if(!ReadFile(outputHandle, buffer, sizeof(buffer), &bytesRead, NONE))
+		return true;
+
+#ifdef COMPILER_MSVC
+	/*
+	 * cl prints the source file name and link prints informational lines (import library, LTCG), so the output is never empty.
+	 * Warnings and errors always contain " warning " or " error ". Output that doesn't fit into the buffer is never only informational.
+	 */
+	return bytesRead == sizeof(buffer) ||
+	       _str_contains(_str(buffer, (int)bytesRead), _s(" warning ")) ||
+	       _str_contains(_str(buffer, (int)bytesRead), _s(" error "));
+#else
+	/* gcc, clang and their linkers print nothing on success */
+	return bytesRead > 0;
+#endif
+}
+#endif
+
 static void _log_job_output(int jobIdx, _bool logError) {
 #ifdef OS_WINDOWS
 	char   buffer[512];
 	_ulong bytesRead    = 0;
 	void*  outputHandle = _g_win32ProcessStdOut[jobIdx];
 
-	if(outputHandle) {
+	if(outputHandle && (logError || _job_output_has_diagnostics(outputHandle))) {
 		if(logError)
 			_log_err(_emptyString, -1, NONE);
 		else
 			_log_msg(_emptyString, -1, NONE);
 
-		do {
-			ReadFile(outputHandle, buffer, sizeof(buffer), &bytesRead, NONE);
+		SetFilePointer(outputHandle, 0, NONE, 0); /* FILE_BEGIN. The file position is shared with the finished job */
+
+		while(ReadFile(outputHandle, buffer, sizeof(buffer), &bytesRead, NONE) && bytesRead > 0)
 			_log_raw(_str(buffer, (int)bytesRead));
-		} while(bytesRead == sizeof(buffer));
 	}
 #endif
 }
@@ -2082,13 +2125,13 @@ static int _wait_jobs(void) {
 			_ulong procExit = 0;
 			GetExitCodeProcess(hProcess, &procExit);
 
-			if(procExit != 0) {
+			if(procExit != 0)
 				exitCode = (int)procExit;
-				_log_job_output(i, true);
-			}
+
+			_log_job_output(i, procExit != 0);
 		}
 
-		CloseHandle(_g_win32ProcessStdOut);
+		CloseHandle(_g_win32ProcessStdOut[i]);
 		CloseHandle(hProcess);
 	}
 
@@ -2108,8 +2151,7 @@ static int _add_job(const _cmdlinebuffer* cmdLine, str workingDir, _bool redirec
 	STARTUPINFOW        startupInfo;
 	PROCESS_INFORMATION processInfo;
 	SECURITY_ATTRIBUTES securityAttributes;
-	void*               stdoutRead  = NONE;
-	void*               stdoutWrite = NONE;
+	void*               outputFile = NONE;
 
 	workingDirBuffer[workingDirLen] = '\0';
 	cmdLineBuffer[cmdLineLen]       = '\0';
@@ -2128,8 +2170,7 @@ static int _add_job(const _cmdlinebuffer* cmdLine, str workingDir, _bool redirec
 
 		GetExitCodeProcess(_g_win32Processes[wait], &exitCode);
 
-		if(exitCode != 0)
-			_log_job_output((int)wait, true);
+		_log_job_output((int)wait, exitCode != 0);
 
 		CloseHandle(_g_win32Processes[wait]);
 		CloseHandle(_g_win32ProcessStdOut[wait]);
@@ -2150,26 +2191,37 @@ static int _add_job(const _cmdlinebuffer* cmdLine, str workingDir, _bool redirec
 	startupInfo.dwFlags = 0x00000100; /* STARTF_USESTDHANDLES */
 
 	if(redirectOutput) {
-		if(!CreatePipe(&stdoutRead, &stdoutWrite, &securityAttributes, 0)) {
-			_log_err(_s("Failed to create stdout pipe"), -1, NONE);
+		/*
+		 * Job output goes to a temporary file instead of a pipe.
+		 * It is only read after the job has finished, which would deadlock as soon as a job fills up the pipe buffer.
+		 */
+		static const _wchar prefix[] = {'b', 'l', 'd', '\0'};
+		_wchar              tempDir[MAX_PATH];
+		_wchar              tempFile[MAX_PATH];
+
+		if(GetTempPathW(MAX_PATH, tempDir) == 0 || GetTempFileNameW(tempDir, prefix, 0, tempFile) == 0) {
+			_log_err(_s("Failed to create temporary file for job output"), -1, NONE);
 			return (int)GetLastError();
 		}
 
-		SetHandleInformation(stdoutRead, 1, 0); /* HANDLE_FLAG_INHERIT set to 0 */
+		/* GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, CREATE_ALWAYS, FILE_ATTRIBUTE_TEMPORARY | FILE_FLAG_DELETE_ON_CLOSE */
+		outputFile = CreateFileW(tempFile, 0xc0000000, 0x7, &securityAttributes, 2, 0x04000100, NONE);
 
-		startupInfo.hStdError  = stdoutWrite;
-		startupInfo.hStdOutput = stdoutWrite;
+		if(outputFile == INVALID_HANDLE_VALUE) {
+			_log_err(_s("Failed to open temporary file for job output"), -1, NONE);
+			return (int)GetLastError();
+		}
+
+		startupInfo.hStdError  = outputFile;
+		startupInfo.hStdOutput = outputFile;
 	} else {
 		startupInfo.hStdError  = _g_win32StdoutHandle;
 		startupInfo.hStdOutput = _g_win32StdoutHandle;
 	}
 
 	if(!CreateProcessW(NONE, cmdLineBuffer, NONE, NONE, 1, 0, NONE, workingDirLen > 0 ? workingDirBuffer : _g_win32Cwd, &startupInfo, &processInfo)) {
-		if(stdoutRead)
-			CloseHandle(stdoutRead);
-
-		if(stdoutWrite)
-			CloseHandle(stdoutWrite);
+		if(outputFile)
+			CloseHandle(outputFile);
 
 		_log_err(_s("Failed to start process '"), -1, NONE);
 		_log_raw(_str(cmdLine->buffer, cmdLine->len));
@@ -2177,13 +2229,10 @@ static int _add_job(const _cmdlinebuffer* cmdLine, str workingDir, _bool redirec
 		return (int)GetLastError();
 	}
 
-	if(stdoutWrite)
-		CloseHandle(stdoutWrite);
-
 	CloseHandle(processInfo.hThread);
 
 	_g_win32Processes[_g_win32ProcessCount]     = processInfo.hProcess;
-	_g_win32ProcessStdOut[_g_win32ProcessCount] = stdoutRead;
+	_g_win32ProcessStdOut[_g_win32ProcessCount] = outputFile;
 	++_g_win32ProcessCount;
 #endif
 
@@ -2385,7 +2434,7 @@ static int _build(void) {
 				_log_err(_s("No target named '"), -1, NONE);
 				_log_raw(_cstr(*nameIt));
 				_log_raw(_s("'"));
-				return 0;
+				return 1;
 			}
 
 			for(i = 0; i < _g_targetCount; ++i) {
@@ -2450,7 +2499,7 @@ static int _build(void) {
 			exitCode = _wait_jobs();
 	}
 
-	if(_g_install)
+	if(_g_install && exitCode == 0)
 		_check(_install());
 
 	return exitCode;
