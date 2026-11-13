@@ -205,7 +205,8 @@ typedef struct {
 } _compileoptions;
 
 typedef struct {
-	_cmdlinebuffer _flags;
+	_cmdlinebuffer _flags;    /* Linker flags for executables and shared libraries */
+	_cmdlinebuffer _libFlags; /* Librarian flags for static libraries */
 } _linkoptions;
 
 typedef enum {
@@ -222,6 +223,7 @@ struct _target {
 	const char*     name;
 	str             projectDir;
 	str             installDir;
+	str             installDirBase; /* Directory of the project file that set installDir */
 	_artifact_type  type;
 	_compileoptions compileOpt;
 	_linkoptions    linkOpt;
@@ -241,6 +243,7 @@ typedef enum {
 
 typedef struct {
 	Target      target;
+	str         dir; /* Directory that fileName is relative to, from target_sources */
 	str         fileName;
 	_sourcekind kind;
 	int         compiled;
@@ -262,6 +265,8 @@ static const str       _emptyString = {NONE, 0};
 
 static str             _g_buildDir;
 static str             _g_installDir;
+static str             _g_installDirBase;   /* Directory of the project file that set _g_installDir */
+static str             _g_projectFileDir;   /* Directory of the current project file (begin_project) */
 static str             _g_currentProjectDir;
 static _bool           _g_verbose     = false;
 static _bool           _g_incremental = false;
@@ -993,6 +998,9 @@ static int _create_directory(str path, int line, const char* file) {
 		}
 
 		*p = curr;
+
+		if(!curr)
+			break; /* Path without trailing separator: don't step over the terminator */
 	}
 #endif
 
@@ -1034,6 +1042,20 @@ error:
 }
 
 #define copy_file(src, dst) _check(_copy_file(_cstr(src), _cstr(dst), __LINE__, __FILE__))
+
+/*
+ * Deletes a file if it exists
+ */
+static int _delete_file(str path) {
+#ifdef OS_WINDOWS
+	_wchar pathBuffer[MAX_PATH];
+
+	_check(_win32_assemble_path(path, pathBuffer));
+	DeleteFileW(pathBuffer); /* Fails if there is no such file, which is fine */
+#endif
+
+	return 0;
+}
 
 /*
  * ParseList
@@ -1130,24 +1152,38 @@ static void _get_lastmodified(str filePath, _filetime* fileTime) {
 #endif
 }
 
+/*
+ * Path of a source file relative to its target's project directory (or absolute)
+ */
+static int _assemble_source_rel_path(const _source* source, _pathbuffer* pathBuffer) {
+	if(!_path_is_abs(source->fileName))
+		_check(_path_add_segment(source->dir, pathBuffer));
+
+	return _path_append_raw(source->fileName, pathBuffer);
+}
+
 static int _assemble_source_path(const _source* source, _pathbuffer* pathBuffer) {
-	if(!_path_is_abs(source->fileName)) {
+	if(!_path_is_abs(source->fileName) && !_path_is_abs(source->dir)) {
 		if(!_path_is_abs(source->target->projectDir))
 			_check(_path_add_segment(_g_cwd, pathBuffer));
 
 		_check(_path_add_segment(source->target->projectDir, pathBuffer));
 	}
 
-	_check(_path_append_raw(source->fileName, pathBuffer));
-
-	return 0;
+	return _assemble_source_rel_path(source, pathBuffer);
 }
 
+typedef struct {
+	Target target;
+	str    dir;
+} _targetsourcesdata;
+
 static int _target_source_callback(str fileName, void* userData, int line, const char* file) {
-	_pathbuffer pathBuffer;
-	Target      target  = (Target)userData;
-	const str   fileExt = _file_ext(fileName);
-	_source*    source;
+	_pathbuffer               pathBuffer;
+	const _targetsourcesdata* data    = (const _targetsourcesdata*)userData;
+	const Target              target  = data->target;
+	const str                 fileExt = _file_ext(fileName);
+	_source*                  source;
 
 	if(_g_sourceCount >= MAX_SOURCES) {
 		_log_err(_s("Too many sources, define MAX_SOURCES to increase limit (" _stringify(MAX_SOURCES) ")"), line, file);
@@ -1183,6 +1219,7 @@ static int _target_source_callback(str fileName, void* userData, int line, const
 	}
 
 	source->target   = target;
+	source->dir      = data->dir;
 	source->fileName = fileName;
 
 	pathBuffer.len = 0;
@@ -1194,37 +1231,103 @@ static int _target_source_callback(str fileName, void* userData, int line, const
 	return 0;
 }
 
-static int _target_sources(const void* targetOrTargetName, const char* sources, int line, const char* file) {
-	Target target = _get_target(targetOrTargetName, line, file);
+static int _target_sources(const void* targetOrTargetName, const char* dir, const char* sources, int line, const char* file) {
+	_targetsourcesdata data;
 
-	if(target == NONE)
+	data.target = _get_target(targetOrTargetName, line, file);
+
+	if(data.target == NONE)
 		return 1;
 
-	return _parse_list(sources, _target_source_callback, target, line, file);
+	data.dir = dir != NONE ? _cstr(dir) : _emptyString;
+
+	return _parse_list(sources, _target_source_callback, &data, line, file);
 }
 
-#define target_sources(target_or_target_name, source_list) _target_sources(target_or_target_name, source_list, __LINE__, __FILE__)
+/*
+ * Adds sources in a directory (relative to the project directory, or NONE),
+ */
+#define target_sources(target_or_target_name, dir, source_list) \
+	_target_sources(target_or_target_name, dir, source_list, __LINE__, __FILE__)
 
 /*
  * Target output files
+ *
+ * Everything goes into a subdirectory of the build directory named after the build config so that artifacts of
+ * different configs don't mix:
+ *   <build dir>/<config>/<target name>.<ext> (binaries, pdb)
+ *   <build dir>/<config>/obj/<target name>/<source path relative to project dir>.obj  (objects, compiler pdb)
  */
 
-static str _rel_build_path(str path) {
-	path = _path_without_file(path);
+static str _config_dirname(_buildconfig buildConfig) {
+	switch(buildConfig) {
+	case Debug:
+		return _s("dbg");
+	case Release:
+		return _s("rel");
+	case Profiling:
+		return _s("prf");
+	default:
+		return _s("unknown");
+	}
+}
 
+/*
+ * Appends a relative or absolute path so that it stays inside the build directory:
+ * Absolute paths are made relative to the working directory (or lose their root if they are outside of it),
+ * '.' segments are removed and '..' segments become '__'.
+ */
+static int _path_append_build_rel(str path, _pathbuffer* buffer) {
 	if(_path_is_abs(path)) {
 		if(_path_prefix(path, _g_cwd)) {
 			path.data += _g_cwd.len;
 			path.len  -= _g_cwd.len;
 		} else {
-			do {
+			while(path.len > 0 && !is_pathsep(path.data[0])) {
 				++path.data;
 				--path.len;
-			} while(path.len > 0 && !is_pathsep(path.data[-1]));
+			}
 		}
 	}
 
-	return path;
+	while(path.len > 0) {
+		str   segment;
+		_bool hasPathSep;
+
+		segment = _str(path.data, 0);
+
+		while(segment.len < path.len && !is_pathsep(path.data[segment.len]))
+			++segment.len;
+
+		path.data += segment.len;
+		path.len  -= segment.len;
+		hasPathSep = path.len > 0;
+
+		if(hasPathSep) {
+			++path.data;
+			--path.len;
+		}
+
+		if(segment.len == 0 || _str_eq(segment, _s(".")))
+			continue;
+
+		if(_str_eq(segment, _s("..")))
+			segment = _s("__");
+
+		_check(hasPathSep ? _path_add_segment(segment, buffer) : _path_append_raw(segment, buffer));
+	}
+
+	return 0;
+}
+
+static int _make_config_dirpath(_pathbuffer* buffer) {
+	if(!_path_is_abs(_g_buildDir))
+		_check(_path_add_segment(_g_cwd, buffer));
+
+	_check(_path_add_segment(_g_buildDir, buffer));
+	_check(_path_add_segment(_config_dirname(_g_config), buffer));
+
+	return 0;
 }
 
 static str _artifact_file_ext(_artifact_type artifactType) {
@@ -1266,23 +1369,33 @@ static str _artifact_file_ext(_artifact_type artifactType) {
 	}
 }
 
-static int _make_artifact_filepath(str baseName, str projectDir, _artifact_type artifactType, _pathbuffer* buffer) {
-	if(!_path_is_abs(_g_buildDir))
-		_check(_path_add_segment(_g_cwd, buffer));
+/*
+ * Output file of a target (binary or linker pdb)
+ */
+static int _make_target_filepath(str targetName, _artifact_type artifactType, _pathbuffer* buffer) {
+	_check(_make_config_dirpath(buffer));
+	_check(_path_append_build_rel(_path_without_file(targetName), buffer));
+	_check(_path_append_raw(_file_basename(_file_without_path(targetName)), buffer));
+	_check(_path_append_raw(_artifact_file_ext(artifactType), buffer));
 
-	_check(_path_add_segment(_g_buildDir, buffer));
-	_check(_path_add_segment(_rel_build_path(projectDir), buffer));
-	_check(_path_add_segment(_rel_build_path(baseName), buffer));
+	return 0;
+}
 
-	/*
-	 * Keep original extension for object and pbd files and add target extension at
-	 * the end, to avoid ambiguities if a source file has the same name as the target
-	 * */
-	if(artifactType == ObjectFile || artifactType == DebugInformation)
-		_check(_path_append_raw(_file_without_path(baseName), buffer));
-	else
-		_check(_path_append_raw(_file_basename(_file_without_path(baseName)), buffer));
+/*
+ * Output file of a source (object or compiler pdb).
+ * Keeps the source's extension and adds the artifact's extension at the end, so foo.c and foo.cpp don't collide.
+ */
+static int _make_source_filepath(const _source* source, _artifact_type artifactType, _pathbuffer* buffer) {
+	_pathbuffer relPathBuffer;
 
+	relPathBuffer.len = 0;
+	_check(_assemble_source_rel_path(source, &relPathBuffer));
+
+	_check(_make_config_dirpath(buffer));
+	_check(_path_add_segment(_s("obj"), buffer));
+	_check(_path_append_build_rel(_cstr(source->target->name), buffer));
+	_check(_path_add_segment(_emptyString, buffer));
+	_check(_path_append_build_rel(_str(relPathBuffer.data, relPathBuffer.len), buffer));
 	_check(_path_append_raw(_artifact_file_ext(artifactType), buffer));
 
 	return 0;
@@ -1310,12 +1423,10 @@ static int _add_target(const char* name, _artifact_type type, const char* source
 	target->type       = type;
 
 	pathBuffer.len = 0;
-	_check(_make_artifact_filepath(_cstr(target->name), target->projectDir, target->type, &pathBuffer));
+	_check(_make_target_filepath(_cstr(target->name), target->type, &pathBuffer));
 	_get_lastmodified(_str(pathBuffer.data, pathBuffer.len), &target->_lastModified);
 
-	target_sources(target, sources);
-
-	return 0;
+	return _target_sources(target, NONE, sources, line, file);
 }
 
 static Target _nextTarget(void){
@@ -1373,19 +1484,27 @@ static str _compiler_executable(_sourcekind sourceKind) {
 	}
 }
 
-static str _linker_executable(_artifact_type artifactType) {
-	(void)artifactType;
+static str _linker_executable(void) {
 #ifdef COMPILER_MSVC
-	if(artifactType == StaticLibrary)
-		return _s("lib");
-
-	return _s("link");
+	return _s("cl");
 #elif defined(COMPILER_CLANG)
 	return _s("clang");
 #elif defined(COMPILER_GCC)
 	return _s("gcc");
 #else
 	#error "Unsupported linker"
+#endif
+}
+
+static str _librarian_executable(void) {
+#ifdef COMPILER_MSVC
+	return _s("lib");
+#elif defined(OS_WINDOWS) && defined(COMPILER_CLANG)
+	return _s("llvm-ar");
+#elif defined(COMPILER_GCC) || defined(COMPILER_CLANG)
+	return _s("ar");
+#else
+	#error "Unsupported librarian"
 #endif
 }
 
@@ -1602,6 +1721,14 @@ static int _cmdline_add_compile_options(const _source* source, const _compileopt
 #endif
 	}
 
+	if(_g_config != Debug) {
+#ifdef COMPILER_MSVC
+		_check(_cmdline_add_arg(_s("/DNDEBUG"), cmdLine));
+#else
+		_check(_cmdline_add_arg(_s("-DNDEBUG"), cmdLine));
+#endif
+	}
+
 	if(debugInfo == Enabled) {
 #ifdef COMPILER_MSVC
 		if(source->target->type == StaticLibrary) {
@@ -1612,7 +1739,7 @@ static int _cmdline_add_compile_options(const _source* source, const _compileopt
 			_check(_cmdline_add_arg(_s("/Zi"), cmdLine));
 			_check(_cmdline_add_arg(_s("/Fd"), cmdLine));
 			pathBuffer.len = 0;
-			_check(_make_artifact_filepath(source->fileName, source->target->projectDir, DebugInformation, &pathBuffer));
+			_check(_make_source_filepath(source, DebugInformation, &pathBuffer));
 			_check(_cmdline_append_arg(_str(pathBuffer.data, pathBuffer.len), cmdLine));
 		}
 #else
@@ -1689,65 +1816,9 @@ static int _cmdline_add_link_options(const _linkoptions* defaults, const _linkop
 	return 0;
 }
 
-static int _build_linker_cmdline(Target target, _cmdlinebuffer* cmdLine) {
+static int _cmdline_add_object_files(Target target, _cmdlinebuffer* cmdLine) {
 	_pathbuffer pathBuffer;
-	str         linker = _linker_executable(target->type);
 	int         i;
-
-	if(linker.len == 0) {
-		_log_err(_s("No matching linker executable could be identified for this compiler and platform"), -1, NONE);
-		return 1;
-	}
-
-	cmdLine->len   = 0;
-	pathBuffer.len = 0;
-
-	_check(_cmdline_add_arg(linker, cmdLine));
-
-#ifdef COMPILER_MSVC
-	_check(_cmdline_add_arg(_s("/NOLOGO"), cmdLine));
-
-	if(target->type != StaticLibrary)
-		_check(_cmdline_add_arg(_s("/INCREMENTAL:NO"), cmdLine));
-#endif
-
-	if(target->type == SharedLibrary) {
-#ifdef COMPILER_MSVC
-		_check(_cmdline_add_arg(_s("/DLL"), cmdLine));
-#else
-		_check(_cmdline_add_arg(_s("--shared"), cmdLine));
-#endif
-	} else if(target->type == StaticLibrary) {
-#ifdef COMPILER_MSVC
-		_check(_cmdline_add_arg(_s("--static"), cmdLine));
-#endif
-	}
-
-	_cmdline_add_link_options(&_g_linkOptions, &target->linkOpt, cmdLine);
-
-	if(target->compileOpt.debugInformation == Enabled ||
-	   (target->compileOpt.debugInformation == NotSet && _g_compileOptions.debugInformation == Enabled )) {
-#ifdef COMPILER_MSVC
-		if(target->type != StaticLibrary) {
-			_check(_cmdline_add_arg(_s("/DEBUG:FULL"), cmdLine));
-			_check(_cmdline_add_arg(_s("/PDB:"), cmdLine));
-
-			pathBuffer.len = 0;
-			_check(_make_artifact_filepath(_file_basename(_cstr(target->name)), target->projectDir, DebugInformation, &pathBuffer));
-			_check(_cmdline_append_arg(_str(pathBuffer.data, pathBuffer.len), cmdLine));
-		}
-#endif
-	}
-
-#ifdef COMPILER_MSVC
-	_check(_cmdline_add_arg(_s("/OUT:"), cmdLine));
-#else
-	_check(_cmdline_add_arg(_s("-o"), cmdLine));
-#endif
-
-	pathBuffer.len = 0;
-	_check(_make_artifact_filepath(_cstr(target->name), target->projectDir, target->type, &pathBuffer));
-	_check(_cmdline_append_arg(_str(pathBuffer.data, pathBuffer.len), cmdLine));
 
 	for(i = 0; i < _g_sourceCount; ++i) {
 		_source* source = &_g_sources[i];
@@ -1756,9 +1827,119 @@ static int _build_linker_cmdline(Target target, _cmdlinebuffer* cmdLine) {
 			continue;
 
 		pathBuffer.len = 0;
-		_check(_make_artifact_filepath(source->fileName, target->projectDir, ObjectFile, &pathBuffer));
+		_check(_make_source_filepath(source, ObjectFile, &pathBuffer));
 		_check(_cmdline_add_arg(_str(pathBuffer.data, pathBuffer.len), cmdLine));
 	}
+
+	return 0;
+}
+
+/*
+ * Whether linking the target writes a pdb (MSVC with debug information. Static libraries have it embedded)
+ */
+static _bool _target_has_linker_pdb(Target target) {
+#ifdef COMPILER_MSVC
+	if(target->type == StaticLibrary)
+		return false;
+
+	if(target->compileOpt.debugInformation != NotSet)
+		return target->compileOpt.debugInformation == Enabled;
+
+	return _g_compileOptions.debugInformation == Enabled;
+#else
+	(void)target;
+	return false;
+#endif
+}
+
+static int _build_librarian_cmdline(Target target, _cmdlinebuffer* cmdLine) {
+	_pathbuffer pathBuffer;
+
+	cmdLine->len   = 0;
+	pathBuffer.len = 0;
+
+	_check(_cmdline_add_arg(_librarian_executable(), cmdLine));
+
+#ifdef COMPILER_MSVC
+	_check(_cmdline_add_arg(_s("/NOLOGO"), cmdLine));
+#else
+	_check(_cmdline_add_arg(_s("rcs"), cmdLine)); /* Replace or add members, create the archive, write a symbol index */
+#endif
+
+	/* Static libraries aren't linked: they get the lib flags instead of the link flags */
+	_check(_cmdline_combine(cmdLine, &_g_linkOptions._libFlags));
+	_check(_cmdline_combine(cmdLine, &target->linkOpt._libFlags));
+
+	_check(_make_target_filepath(_cstr(target->name), StaticLibrary, &pathBuffer));
+
+#ifdef COMPILER_MSVC
+	_check(_cmdline_add_arg(_s("/OUT:"), cmdLine));
+	_check(_cmdline_append_arg(_str(pathBuffer.data, pathBuffer.len), cmdLine));
+#else
+	_check(_cmdline_add_arg(_str(pathBuffer.data, pathBuffer.len), cmdLine));
+#endif
+
+	return _cmdline_add_object_files(target, cmdLine);
+}
+
+static int _build_linker_cmdline(Target target, _cmdlinebuffer* cmdLine) {
+	_pathbuffer pathBuffer;
+
+	if(target->type == StaticLibrary)
+		return _build_librarian_cmdline(target, cmdLine);
+
+	cmdLine->len   = 0;
+	pathBuffer.len = 0;
+
+	_check(_cmdline_add_arg(_linker_executable(), cmdLine));
+
+	/*
+	 * Object files come before the libraries in the link options: GNU ld only takes symbols from a library that are
+	 * needed by the inputs before it.
+	 */
+#ifdef COMPILER_MSVC
+	_check(_cmdline_add_arg(_s("/nologo"), cmdLine));
+#endif
+
+	_check(_cmdline_add_object_files(target, cmdLine));
+
+#ifdef COMPILER_MSVC
+	/* cl passes the object files on to the linker, everything after /link are linker options */
+	_check(_cmdline_add_arg(_s("/link"), cmdLine));
+	_check(_cmdline_add_arg(_s("/NOLOGO"), cmdLine));
+	_check(_cmdline_add_arg(_s("/INCREMENTAL:NO"), cmdLine));
+#endif
+
+	if(target->type == SharedLibrary) {
+#ifdef COMPILER_MSVC
+		_check(_cmdline_add_arg(_s("/DLL"), cmdLine));
+#else
+		_check(_cmdline_add_arg(_s("--shared"), cmdLine));
+#endif
+	}
+
+	_check(_cmdline_add_link_options(&_g_linkOptions, &target->linkOpt, cmdLine));
+
+#ifdef COMPILER_MSVC
+	if(_target_has_linker_pdb(target)) {
+		_check(_cmdline_add_arg(_s("/DEBUG:FULL"), cmdLine));
+		_check(_cmdline_add_arg(_s("/PDB:"), cmdLine));
+
+		pathBuffer.len = 0;
+		_check(_make_target_filepath(_cstr(target->name), DebugInformation, &pathBuffer));
+		_check(_cmdline_append_arg(_str(pathBuffer.data, pathBuffer.len), cmdLine));
+	}
+#endif
+
+#ifdef COMPILER_MSVC
+	_check(_cmdline_add_arg(_s("/OUT:"), cmdLine));
+#else
+	_check(_cmdline_add_arg(_s("-o"), cmdLine));
+#endif
+
+	pathBuffer.len = 0;
+	_check(_make_target_filepath(_cstr(target->name), target->type, &pathBuffer));
+	_check(_cmdline_append_arg(_str(pathBuffer.data, pathBuffer.len), cmdLine));
 
 	return 0;
 }
@@ -1895,6 +2076,21 @@ static int _add_defines_callback(str defineStr, void* userData, int line, const 
 		_check(_parse_list(flag_list, _add_flags_callback, &_target->linkOpt._flags, __LINE__, __FILE__)); \
 	} while((void)0,0)
 
+/*
+ * Librarian options, used instead of the linker options when creating static libraries (lib, llvm-ar, ar)
+ */
+
+#define lib_flags(flag_list) \
+	_check(_parse_list(flag_list, _add_flags_callback, &_g_linkOptions._libFlags, __LINE__, __FILE__))
+
+#define target_lib_flags(target_or_target_name, flag_list) \
+	do { \
+		Target _target = _get_target(target_or_target_name, __LINE__, __FILE__); \
+		if(_target == NONE) \
+			return 1; \
+		_check(_parse_list(flag_list, _add_flags_callback, &_target->linkOpt._libFlags, __LINE__, __FILE__)); \
+	} while((void)0,0)
+
 static int _target_lib_path(str libPath, _cmdlinebuffer* cmdLine) {
 	if(libPath.len >= 0) {
 #ifdef COMPILER_MSVC
@@ -1990,10 +2186,15 @@ static int _target_link(Target target, Target linkedTarget, int line, const char
 	linkedTarget->_isLinkTarget = true;
 
 	targetLibDirBuffer.len = 0;
-	_check(_make_artifact_filepath(_cstr(linkedTarget->name), target->projectDir, target->type, &targetLibDirBuffer));
+	_check(_make_target_filepath(_cstr(linkedTarget->name), linkedTarget->type, &targetLibDirBuffer));
 
-	_check(_target_lib_path(_path_without_file(_str(targetLibDirBuffer.data, targetLibDirBuffer.len)), &target->linkOpt._flags));
-	_check(_target_link_lib(_cstr(linkedTarget->name), &target->linkOpt._flags));
+	/* Static libraries by path because -l<name> looks for <name>.lib or lib<name>.a, not the <name>.a created here */
+	if(linkedTarget->type == StaticLibrary) {
+		_check(_cmdline_add_arg(_str(targetLibDirBuffer.data, targetLibDirBuffer.len), &target->linkOpt._flags));
+	} else {
+		_check(_target_lib_path(_path_without_file(_str(targetLibDirBuffer.data, targetLibDirBuffer.len)), &target->linkOpt._flags));
+		_check(_target_link_lib(_cstr(linkedTarget->name), &target->linkOpt._flags));
+	}
 
 	return 0;
 }
@@ -2051,15 +2252,20 @@ static int _add_lib_paths_callback(str libPath, void* userData, int line, const 
 		_check(_parse_list(path_list, _add_lib_paths_callback, &_target->linkOpt._flags, __LINE__, __FILE__)); \
 	} while((void)0,0)
 
+/* A relative install directory is relative to the directory of the project file */
 #define install_directory(install_dir) \
-	_g_installDir = _cstr(install_dir)
+	do { \
+		_g_installDir     = _cstr(install_dir); \
+		_g_installDirBase = _g_projectFileDir; \
+	} while((void)0,0)
 
 #define target_install_directory(target_or_target_name, install_dir) \
 	do { \
 		Target target = _get_target(target_or_target_name, __LINE__, __FILE__); \
 		if(target == NONE) \
 			return 1; \
-		target->installDir = _cstr(install_dir); \
+		target->installDir     = _cstr(install_dir); \
+		target->installDirBase = _g_projectFileDir; \
 	} while((void)0,0)
 
 /*
@@ -2113,7 +2319,11 @@ static void _log_job_output(int jobIdx, _bool logError) {
 
 static int _wait_jobs(void) {
 	int exitCode = 0;
+
+#ifdef OS_WINDOWS
 	int i;
+
+	log_flush(); /* Show the pending log line before blocking */
 
 	for(i = 0; i < _g_win32ProcessCount; ++i) {
 		void*  hProcess = _g_win32Processes[i];
@@ -2140,6 +2350,7 @@ static int _wait_jobs(void) {
 	_g_win32ProcessCount = 0;
 
 	return exitCode;
+#endif
 }
 
 static int _add_job(const _cmdlinebuffer* cmdLine, str workingDir, _bool redirectOutput) {
@@ -2152,6 +2363,9 @@ static int _add_job(const _cmdlinebuffer* cmdLine, str workingDir, _bool redirec
 	PROCESS_INFORMATION processInfo;
 	SECURITY_ATTRIBUTES securityAttributes;
 	void*               outputFile = NONE;
+
+	/* A log line is only written once it ends, i.e. with the next message. Show what is about to run now. */
+	log_flush();
 
 	workingDirBuffer[workingDirLen] = '\0';
 	cmdLineBuffer[cmdLineLen]       = '\0';
@@ -2256,7 +2470,7 @@ static int _add_compile_job(_source* source) {
 	str            objFilePath;
 
 	pathBuffer.len = 0;
-	_check(_make_artifact_filepath(source->fileName, source->target->projectDir, ObjectFile, &pathBuffer));
+	_check(_make_source_filepath(source, ObjectFile, &pathBuffer));
 	objFilePath = _str(pathBuffer.data, pathBuffer.len);
 
 	_get_lastmodified(objFilePath, &objLastModified);
@@ -2304,7 +2518,7 @@ static int _add_link_job(Target target) {
 				continue;
 
 			pathBuffer.len = 0;
-			_check(_make_artifact_filepath(source->fileName, target->projectDir, ObjectFile, &pathBuffer));
+			_check(_make_source_filepath(source, ObjectFile, &pathBuffer));
 			_get_lastmodified(_str(pathBuffer.data, pathBuffer.len), &lastModified);
 
 			if(_filetime_is_newer(lastModified, target->_lastModified)) {
@@ -2318,6 +2532,15 @@ static int _add_link_job(Target target) {
 		return 0;
 
 	_check(_build_linker_cmdline(target, &cmdLine));
+
+#ifndef COMPILER_MSVC
+	/* ar adds to an existing archive, which would keep the objects of removed sources */
+	if(target->type == StaticLibrary) {
+		pathBuffer.len = 0;
+		_check(_make_target_filepath(_cstr(target->name), StaticLibrary, &pathBuffer));
+		_check(_delete_file(_str(pathBuffer.data, pathBuffer.len)));
+	}
+#endif
 
 	if(_g_verbose)
 		_log_cmdline(&cmdLine);
@@ -2368,6 +2591,7 @@ static int _install(void) {
 	for(i = 0; i < _g_targetCount; ++i) {
 		const Target target = &_g_targets[i];
 		str          installDir;
+		str          installDirBase;
 		_pathbuffer  artifactPathBuffer;
 		_pathbuffer  installPathBuffer;
 		int          pathLen;
@@ -2375,10 +2599,14 @@ static int _install(void) {
 		if(target->_skipBuild)
 			continue;
 
-		installDir = target->installDir;
+		installDir     = target->installDir;
+		installDirBase = target->installDirBase;
 
-		if(installDir.len == 0)
-			installDir = _g_installDir;
+		/* Static libraries are only intermediate artifacts, install them only if the target asks for it explicitly */
+		if(installDir.len == 0 && target->type != StaticLibrary) {
+			installDir     = _g_installDir;
+			installDirBase = _g_installDirBase;
+		}
 
 		if(installDir.len == 0)
 			continue;
@@ -2390,23 +2618,27 @@ static int _install(void) {
 
 		installPathBuffer.len = 0;
 
-		if(!_path_is_abs(installDir))
-			_check(_path_add_segment(_path_without_file(target->projectDir), &installPathBuffer));
+		/* Relative install directories are relative to the project file that set them */
+		if(!_path_is_abs(installDir)) {
+			if(!_path_is_abs(installDirBase))
+				_check(_path_add_segment(_g_cwd, &installPathBuffer));
+
+			_check(_path_add_segment(installDirBase, &installPathBuffer));
+		}
 
 		_check(_path_add_segment(installDir, &installPathBuffer));
 
 		artifactPathBuffer.len = 0;
-		_check(_make_artifact_filepath(_cstr(target->name), target->projectDir, target->type, &artifactPathBuffer));
+		_check(_make_target_filepath(_cstr(target->name), target->type, &artifactPathBuffer));
 
 		pathLen = installPathBuffer.len;
 
 		_check(_path_append_raw(_file_without_path(_str(artifactPathBuffer.data, artifactPathBuffer.len)), &installPathBuffer));
 		_check(_copy_file(_str(artifactPathBuffer.data, artifactPathBuffer.len), _str(installPathBuffer.data, installPathBuffer.len), -1, NONE));
 
-		if(target->compileOpt.debugInformation == Enabled ||
-			(target->compileOpt.debugInformation == NotSet && _g_compileOptions.debugInformation == Enabled )) {
+		if(_target_has_linker_pdb(target)) {
 			artifactPathBuffer.len = 0;
-			_check(_make_artifact_filepath(_cstr(target->name), target->projectDir, DebugInformation, &artifactPathBuffer));
+			_check(_make_target_filepath(_cstr(target->name), DebugInformation, &artifactPathBuffer));
 
 			installPathBuffer.len = pathLen;
 			_check(_path_append_raw(_file_without_path(_str(artifactPathBuffer.data, artifactPathBuffer.len)), &installPathBuffer));
@@ -2572,8 +2804,9 @@ static int _rebuild_if_needed(const char* srcFile, int argc, char** argv, _bool*
 		 */
 
 		pathBuffer.len = 0;
-		_check(_make_artifact_filepath(targetName, target->projectDir, target->type, &pathBuffer));
+		_check(_make_target_filepath(targetName, target->type, &pathBuffer));
 		artifactPath = _str(pathBuffer.data, pathBuffer.len);
+		_check(_create_directory(_path_without_file(artifactPath), -1, NONE));
 		_check(_path_append_raw(_s(".old"), &pathBuffer));
 		_check(_win32_assemble_path(_str(pathBuffer.data, pathBuffer.len), wTmpExePathBuffer));
 
@@ -2639,7 +2872,8 @@ static int _rebuild_if_needed(const char* srcFile, int argc, char** argv, _bool*
 
 #define begin_project(project_identifier) \
 	int _main(int argc, char** argv) { \
-		_g_currentProjectDir = _path_without_file(_s(__FILE__)); \
+		_g_projectFileDir    = _path_without_file(_s(__FILE__)); \
+		_g_currentProjectDir = _g_projectFileDir; \
 		do { \
 			_bool didRebuild = false; \
 			_check(_rebuild_if_needed(__FILE__, argc, argv, &didRebuild)); \
@@ -2655,8 +2889,12 @@ static int _rebuild_if_needed(const char* srcFile, int argc, char** argv, _bool*
 
 #define include_project(project_identifier) \
 	do { \
-		int project_identifier ## _main(int argc, char** argv); \
+		int       project_identifier ## _main(int argc, char** argv); \
+		const str _prevProjectFileDir    = _g_projectFileDir; \
+		const str _prevCurrentProjectDir = _g_currentProjectDir; \
 		_check(project_identifier ## _main(argc, argv)); \
+		_g_projectFileDir    = _prevProjectFileDir; \
+		_g_currentProjectDir = _prevCurrentProjectDir; \
 	} while((void)0,0)
 
 #define project_directory(directory_name) \
@@ -2917,7 +3155,8 @@ void* __cdecl memmove(void* dest, const void* src, unsigned long long size) {
 	int project_identifier ## _main(int argc, char** argv) { \
 		(void)argc; \
 		(void)argv; \
-		_g_currentProjectDir = _path_without_file(_s(__FILE__)); \
+		_g_projectFileDir    = _path_without_file(_s(__FILE__)); \
+		_g_currentProjectDir = _g_projectFileDir; \
 		do {
 
 #undef end_project

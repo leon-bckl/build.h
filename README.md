@@ -35,7 +35,9 @@ The following arguments can be used when calling the compiled build system execu
 - `--debug` disables optimization and generates debug information.
 - `--release` produces optimized binaries without debug information.
 - `--profiling` is the same as release but with debug information.
-- `-b<dirname>` specifies the build directory where the artifacts are created. By default it is `./.build`.
+- `-b<dirname>` specifies the build directory where the artifacts are created. By default it is `./.build`. Each config gets its own subdirectory (`dbg`, `rel`, `prf`), so artifacts of different configs never mix:
+  - `<build dir>/<config>/<target>.<ext>` for binaries, import libraries and linker pdbs
+  - `<build dir>/<config>/obj/<target>/<source path>.obj` for object files, where the source path is relative to the target's project directory. `..` segments become `__`, so object files always stay inside the build directory.
 - `--incremental` only compiles the source files that have changed by looking at their last-modified timestamp and comparing it against the compiled object file. This does not consider changes in included headers yet.
 - `<target>` (without `-`) only builds the target with that name and its dependencies. Multiple targets can be specified.
 
@@ -57,12 +59,26 @@ Target myProgram = executable("MyProgram", "main.c");
 target_defines(myProgram, "FOO=1");
 ```
 
+Source paths are relative to the project directory (see `project_directory`). `target_sources` takes the directory of its sources as the second parameter (or `NONE`), so it doesn't have to be repeated for every file:
+
+```cpp
+Target core = shared_library("Core", NONE);
+target_sources(core, "src", "main.c util.c");
+target_sources(core, "src/zlib", "inflate.c deflate.c");
+```
+
+The directory must stay valid until the build has finished, like the lists themselves (e.g. a string literal).
+
+Static libraries aren't linked: they are created by the librarian (`lib`, `llvm-ar` or `ar`), which gets the flags from `lib_flags`/`target_lib_flags` instead of `link_flags`/`target_link_flags`. With MSVC, objects compiled with `/GL` need `lib_flags("/LTCG")`.
+
+With `--install`, targets are copied to the directory set by `install_directory` or `target_install_directory`. A relative install directory is relative to the directory of the project file that sets it. Static libraries are only installed if they have their own `target_install_directory`.
+
 ## Lists
 
 Commands such as `target_sources`, `include_paths` and `defines` accept a list of multiple items as a parameter. Lists are strings where individual entries are separated from each other using whitespace, commas or quotes. A list entry that is quoted may contain whitespace and commas.
 
 ```cpp
-target_sources(target, "foo.c bar.c");
+target_sources(target, NONE, "foo.c bar.c");
 include_paths("/usr/local/include \"/path with spaces/include\"");
 defines("FOO,"
         "BAR,"
