@@ -217,6 +217,12 @@ typedef enum {
 	SharedLibrary
 } _artifact_type;
 
+typedef enum {
+	NotLinked,
+	Linking,
+	Linked
+} _linkstate;
+
 typedef struct _target* Target;
 
 struct _target {
@@ -230,7 +236,7 @@ struct _target {
 	_filetime       _lastModified;
 	_bool           _skipBuild;
 	_bool           _needsLink;
-	_bool           _isLinkTarget;
+	_linkstate      _linkState;
 	int             _linkDependencyCount;
 	Target          _linkDependencies[MAX_TARGET_DEPENDENCIES];
 };
@@ -249,6 +255,12 @@ typedef struct {
 	int         compiled;
 	_filetime   lastModified;
 } _source;
+
+typedef struct {
+	void*          stdOut; /* Redirected output of a running job, NONE if it writes to the console */
+	const _source* source; /* Source of a compile job, NONE for the other jobs */
+	Target         target; /* Target of a link job, NONE for the other jobs */
+} _job;
 
 typedef struct {
 	int  len;
@@ -279,7 +291,6 @@ static str             _g_cwd;
 static struct _target  _g_targets[MAX_TARGETS];
 static const char*     _g_targetsToBuild[MAX_TARGETS + 1];
 static int             _g_targetCount = 0;
-static Target          _g_nextTarget  = &_g_targets[0];
 
 static _compileoptions _g_compileOptions;
 static _linkoptions    _g_linkOptions;
@@ -300,7 +311,7 @@ static int    _g_win32CwdLen = 0;
 static _wchar _g_win32Cwd[MAX_PATH];
 static int    _g_win32ProcessCount = 0;
 static void*  _g_win32Processes[MAX_JOBS + 1]; /* +1 so the last entry is always NONE */
-static void*  _g_win32ProcessStdOut[MAX_JOBS + 1]; /* +1 so the last entry is always NONE */
+static _job   _g_win32Jobs[MAX_JOBS + 1];
 #endif
 
 /*
@@ -511,7 +522,7 @@ _import _ulong _winapi SetFilePointer(void* hFile, long lDistanceToMove, long* l
 _import _ulong _winapi GetTempPathW(_ulong nBufferLength, _wchar* lpBuffer);
 _import _uint  _winapi GetTempFileNameW(const _wchar* lpPathName, const _wchar* lpPrefixString, _uint uUnique, _wchar* lpTempFileName);
 
-_import void* _winapi LoadLibraryW(const _wchar* lpLibFileName);
+_import void* _winapi LoadLibraryA(const char* lpLibFileName);
 typedef void(_winapi*_farproc)(void);
 _import _farproc _winapi GetProcAddress(void* hModule, const char* lpProcName);
 
@@ -669,8 +680,8 @@ static str _str_left(str s, int count) {
 
 static str _str_right(str s, int count) {
 	if(count < s.len) {
-		s.len -= count;
-		s.data += s.len;
+		s.data += s.len - count;
+		s.len   = count;
 	}
 
 	return s;
@@ -777,12 +788,16 @@ static str _int_to_string(int intValue, char* buffer) {
 static void _log_err(str msg, int line, const char* file);
 
 static int _path_append_raw(str s, _pathbuffer* buffer) {
+	int i;
+
 	if(buffer->len + s.len > MAX_PATH) {
 		_log_err(_s("Path too long, define MAX_PATH to increase limit (" _stringify(MAX_PATH) ")"), -1, NONE);
 		return 1;
 	}
 
-	mem_copy(&buffer->data[buffer->len], s.data, s.len);
+	for(i = 0; i < s.len; ++i)
+		buffer->data[buffer->len + i] = is_pathsep(s.data[i]) ? '/' : s.data[i];
+
 	buffer->len += s.len;
 
 	return 0;
@@ -812,6 +827,16 @@ static _bool _path_is_abs(str path) {
 
 static _bool path_is_abs(const char* path) {
 	return _path_is_abs(_cstr(path));
+}
+
+/*
+ * Adds a project directory to a path. A relative project directory is relative to the working directory
+ */
+static int _path_add_project_dir(str projectDir, _pathbuffer* buffer) {
+	if(!_path_is_abs(projectDir))
+		_check(_path_add_segment(_g_cwd, buffer));
+
+	return _path_add_segment(projectDir, buffer);
 }
 
 static char _normalized_path_char(int c) {
@@ -868,7 +893,6 @@ static str _path_without_file(str filePath) {
 
 	return filePath;
 }
-
 static str _file_basename(str fileName) {
 	int i = fileName.len - 1;
 
@@ -1163,12 +1187,8 @@ static int _assemble_source_rel_path(const _source* source, _pathbuffer* pathBuf
 }
 
 static int _assemble_source_path(const _source* source, _pathbuffer* pathBuffer) {
-	if(!_path_is_abs(source->fileName) && !_path_is_abs(source->dir)) {
-		if(!_path_is_abs(source->target->projectDir))
-			_check(_path_add_segment(_g_cwd, pathBuffer));
-
-		_check(_path_add_segment(source->target->projectDir, pathBuffer));
-	}
+	if(!_path_is_abs(source->fileName) && !_path_is_abs(source->dir))
+		_check(_path_add_project_dir(source->target->projectDir, pathBuffer));
 
 	return _assemble_source_rel_path(source, pathBuffer);
 }
@@ -1392,7 +1412,7 @@ static int _make_source_filepath(const _source* source, _artifact_type artifactT
 	_check(_assemble_source_rel_path(source, &relPathBuffer));
 
 	_check(_make_config_dirpath(buffer));
-	_check(_path_add_segment(_s("obj"), buffer));
+	_check(_path_add_segment(_s(".obj"), buffer));
 	_check(_path_append_build_rel(_cstr(source->target->name), buffer));
 	_check(_path_add_segment(_emptyString, buffer));
 	_check(_path_append_build_rel(_str(relPathBuffer.data, relPathBuffer.len), buffer));
@@ -1401,20 +1421,359 @@ static int _make_source_filepath(const _source* source, _artifact_type artifactT
 	return 0;
 }
 
-static int _add_target(const char* name, _artifact_type type, const char* sources, int line, const char* file) {
+static _bool _filetime_is_newer(_filetime f1, _filetime f2) {
+	if(f1.hi > f2.hi)
+		return true;
+
+	if(f1.hi == f2.hi)
+		return f1.lo > f2.lo;
+
+	return false;
+}
+
+static _bool _filetime_is_zero(_filetime f) {
+	return f.hi == 0 && f.lo == 0;
+}
+
+/*
+ * Buffered file reading and writing
+ */
+
+typedef struct {
+	void* handle;
+	int   pos;
+	int   len;
+	_bool eof;
+	char  buffer[4096];
+} _filereader;
+
+typedef struct {
+	void* handle;
+	int   len;
+	_bool failed;
+	char  buffer[4096];
+} _filewriter;
+
+/*
+ * Opens a file for reading or creates (truncates) it for writing. Returns NONE if that fails.
+ */
+static void* _open_file(str path, _bool forWriting) {
+#ifdef OS_WINDOWS
+	_wchar pathBuffer[MAX_PATH];
+	void*  handle;
+
+	if(path.len <= 0 || _win32_assemble_path(path, pathBuffer) != 0)
+		return NONE;
+
+	if(forWriting) /* GENERIC_WRITE, no sharing, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL */
+		handle = CreateFileW(pathBuffer, 0x40000000, 0, NONE, 2, FILE_ATTRIBUTE_NORMAL, NONE);
+	else /* GENERIC_READ, FILE_SHARE_READ, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL */
+		handle = CreateFileW(pathBuffer, 0x80000000, 0x1, NONE, 3, FILE_ATTRIBUTE_NORMAL, NONE);
+
+	return handle != INVALID_HANDLE_VALUE ? handle : NONE;
+#else
+	(void)path;
+	(void)forWriting;
+	return NONE;
+#endif
+}
+
+static void _close_file(void* handle) {
+#ifdef OS_WINDOWS
+	if(handle != NONE)
+		CloseHandle(handle);
+#else
+	(void)handle;
+#endif
+}
+
+static void _filereader_init(_filereader* reader, void* handle) {
+	reader->handle = handle;
+	reader->pos    = 0;
+	reader->len    = 0;
+	reader->eof    = false;
+}
+
+/*
+ * Next byte of the file or -1 at its end
+ */
+static int _filereader_getc(_filereader* reader) {
+	if(reader->pos >= reader->len) {
+#ifdef OS_WINDOWS
+		_ulong bytesRead = 0;
+
+		if(reader->eof || !ReadFile(reader->handle, reader->buffer, sizeof(reader->buffer), &bytesRead, NONE) || bytesRead == 0) {
+			reader->eof = true;
+			return -1;
+		}
+
+		reader->pos = 0;
+		reader->len = (int)bytesRead;
+#else
+		reader->eof = true;
+		return -1;
+#endif
+	}
+
+	return (_byte)reader->buffer[reader->pos++];
+}
+
+/*
+ * Puts the byte returned by the last _filereader_getc back
+ */
+static void _filereader_ungetc(_filereader* reader) {
+	if(reader->pos > 0)
+		--reader->pos;
+}
+
+/*
+ * Reads a line into the buffer without its line break (LF or CRLF). Returns the number of bytes or -1 at the end of
+ * the file. A line that doesn't fit into the buffer comes in several pieces, *lineEnd tells whether a piece ends the line.
+ */
+static int _filereader_line(_filereader* reader, char* line, int maxLen, _bool* lineEnd) {
+	int len = 0;
+
+	*lineEnd = false;
+
+	while(len < maxLen) {
+		const int c = _filereader_getc(reader);
+
+		if(c < 0) {
+			if(len == 0)
+				return -1;
+
+			*lineEnd = true;
+			break;
+		}
+
+		if(c == '\n') {
+			*lineEnd = true;
+			break;
+		}
+
+		line[len++] = (char)c;
+	}
+
+	if(*lineEnd && len > 0 && line[len - 1] == '\r')
+		--len;
+
+	return len;
+}
+
+static void _filewriter_init(_filewriter* writer, void* handle) {
+	writer->handle = handle;
+	writer->len    = 0;
+	writer->failed = handle == NONE;
+}
+
+static void _filewriter_flush(_filewriter* writer) {
+#ifdef OS_WINDOWS
+	_ulong bytesWritten = 0;
+
+	if(writer->len > 0 && !writer->failed) {
+		if(!WriteFile(writer->handle, writer->buffer, (_ulong)writer->len, &bytesWritten, NONE) || (int)bytesWritten != writer->len)
+			writer->failed = true;
+	}
+#endif
+
+	writer->len = 0;
+}
+
+static void _filewriter_write(_filewriter* writer, str s) {
+	while(s.len > 0) {
+		int copySize = (int)sizeof(writer->buffer) - writer->len;
+
+		if(copySize > s.len)
+			copySize = s.len;
+
+		mem_copy(writer->buffer + writer->len, s.data, copySize);
+		writer->len += copySize;
+		s.data      += copySize;
+		s.len       -= copySize;
+
+		if(writer->len >= (int)sizeof(writer->buffer))
+			_filewriter_flush(writer);
+	}
+}
+
+/*
+ * Dependency files
+ */
+
+#ifndef MSVC_INCLUDE_NOTE
+	/* Start of cl's /showIncludes lines. A localized compiler prints a translation, define it to that text */
+	#define MSVC_INCLUDE_NOTE "Note: including file:"
+#endif
+
+static int _make_depfile_path(const _source* source, _pathbuffer* buffer) {
+	_check(_make_source_filepath(source, ObjectFile, buffer));
+
+	return _path_append_raw(_s(".d"), buffer);
+}
+
+/*
+ * Resource compilers don't report what they include, so .rc sources have no dependency file
+ */
+static _bool _source_has_depfile(const _source* source) {
+	return source->kind != RcSrc;
+}
+
+static void _depfile_write_path(_filewriter* writer, str path) {
+	int i;
+
+	for(i = 0; i < path.len; ++i) {
+		char c = path.data[i];
+
+		if(is_pathsep(c))
+			c = '/';
+		else if(c == ' ' || c == '#')
+			_filewriter_write(writer, _s("\\"));
+		else if(c == '$')
+			_filewriter_write(writer, _s("$"));
+
+		_filewriter_write(writer, _str(&c, 1));
+	}
+}
+
+static _bool _dependency_up_to_date(str dependency, str workingDir, _filetime artifactTime) {
+	_pathbuffer pathBuffer;
+	_filetime   lastModified;
+
+	pathBuffer.len = 0;
+
+	/* What is still relative after this is relative to the working directory of the build program, like any path given to _get_lastmodified */
+	if(!_path_is_abs(dependency) && _path_add_segment(workingDir, &pathBuffer) != 0)
+		return false;
+
+	if(_path_append_raw(dependency, &pathBuffer) != 0)
+		return false;
+
+	_get_lastmodified(_str(pathBuffer.data, pathBuffer.len), &lastModified);
+
+	if(_filetime_is_zero(lastModified) || _filetime_is_newer(lastModified, artifactTime)) {
+		if(_g_verbose) {
+			_log_msg(_s("Changed: "), -1, NONE);
+			_log_raw(dependency);
+		}
+
+		return false;
+	}
+
+	return true;
+}
+
+static _bool _depfile_up_to_date(str depFilePath, str workingDir, _filetime artifactTime, _bool missingIsUpToDate) {
+	_filereader reader;
+	char        token[MAX_PATH];
+	int         tokenLen = 0;
+	_bool       result   = true;
+	void*       handle   = _open_file(depFilePath, false);
+
+	if(handle == NONE)
+		return missingIsUpToDate;
+
+	_filereader_init(&reader, handle);
+
+	/* Skip the target. It ends with the first ':' that is followed by whitespace, which rules out a drive letter's ':' */
+	for(;;) {
+		int c = _filereader_getc(&reader);
+
+		if(c < 0) {
+			result = false; /* No dependencies at all: the compiler didn't finish writing the file */
+			goto done;
+		}
+
+		if(c == ':') {
+			c = _filereader_getc(&reader);
+
+			if(c < 0 || ascii_isspace(c))
+				break;
+		}
+	}
+
+	for(;;) {
+		int   c        = _filereader_getc(&reader);
+		_bool isEscape = false;
+
+		if(c == '\\') {
+			const int next = _filereader_getc(&reader);
+
+			if(next == '\n' || next == '\r') {
+				c = ' '; /* Line continuation */
+			} else if(next == ' ' || next == '#') {
+				c        = next;
+				isEscape = true;
+			} else if(next >= 0) {
+				_filereader_ungetc(&reader); /* A backslash in a path */
+			}
+		} else if(c == '$') {
+			const int next = _filereader_getc(&reader);
+
+			if(next != '$' && next >= 0)
+				_filereader_ungetc(&reader);
+		}
+
+		if(c < 0 || (!isEscape && ascii_isspace(c))) {
+			if(tokenLen > 0 && !_dependency_up_to_date(_str(token, tokenLen), workingDir, artifactTime)) {
+				result = false;
+				break;
+			}
+
+			tokenLen = 0;
+
+			if(c < 0)
+				break;
+
+			continue;
+		}
+
+		if(tokenLen >= (int)sizeof(token)) {
+			result = false; /* Path too long to check, recompile to be safe */
+			break;
+		}
+
+		token[tokenLen++] = (char)c;
+	}
+
+done:
+	_close_file(handle);
+
+	return result;
+}
+
+static _bool _source_up_to_date(const _source* source, _filetime artifactTime, _bool missingIsUpToDate) {
+	_pathbuffer pathBuffer;
+
+	if(!_filetime_is_newer(artifactTime, source->lastModified))
+		return false;
+
+	if(!_source_has_depfile(source))
+		return true;
+
+	pathBuffer.len = 0;
+
+	if(_make_depfile_path(source, &pathBuffer) != 0)
+		return false;
+
+	return _depfile_up_to_date(_str(pathBuffer.data, pathBuffer.len), source->target->projectDir, artifactTime, missingIsUpToDate);
+}
+
+static Target _add_target(const char* name, _artifact_type type, int line, const char* file) {
 	_pathbuffer pathBuffer;
 	Target      target;
 
 	if(_g_targetCount >= MAX_TARGETS) {
 		_log_err(_s("Too many targets, define MAX_TARGETS to increase limit (" _stringify(MAX_TARGETS) ")"), line, file); \
-		 return 1;
+		log_flush();
+		return NONE;
 	}
 
 	target = find_target(name);
 
 	if(target != NONE) {
-		_log_err(_s("Target name must be unique"), line, file); \
-		 return 1;
+		_log_err(_s("Target name must be unique"), line, file);
+		log_flush();
+		return NONE;
 	}
 
 	target             = &_g_targets[_g_targetCount++];
@@ -1423,23 +1782,17 @@ static int _add_target(const char* name, _artifact_type type, const char* source
 	target->type       = type;
 
 	pathBuffer.len = 0;
-	_check(_make_target_filepath(_cstr(target->name), target->type, &pathBuffer));
+	if(_make_target_filepath(_cstr(target->name), target->type, &pathBuffer) != 0)
+		return NONE;
+
 	_get_lastmodified(_str(pathBuffer.data, pathBuffer.len), &target->_lastModified);
 
-	return _target_sources(target, NONE, sources, line, file);
+	return target;
 }
 
-static Target _nextTarget(void){
-	return _g_nextTarget++;
-}
-
-#define add_target(target_name, target_type, source_list) \
-	_nextTarget(); \
-	_check(_add_target(target_name, target_type, source_list, __LINE__, __FILE__))
-
-#define executable(executable_name, source_list)  add_target(executable_name, Executable, source_list)
-#define static_library(library_name, source_list) add_target(library_name, StaticLibrary, source_list)
-#define shared_library(library_name, source_list) add_target(library_name, SharedLibrary, source_list)
+#define executable(executable_name)  _add_target(executable_name, Executable, __LINE__, __FILE__)
+#define static_library(library_name) _add_target(library_name, StaticLibrary, __LINE__, __FILE__)
+#define shared_library(library_name) _add_target(library_name, SharedLibrary, __LINE__, __FILE__)
 
 /*
  * Executable names
@@ -1719,6 +2072,12 @@ static int _cmdline_add_compile_options(const _source* source, const _compileopt
 #else
 		_check(_cmdline_add_arg(_s("-O2"), cmdLine));
 #endif
+	} else if(optimizations == OptimizeSize) {
+#ifdef COMPILER_MSVC
+		_check(_cmdline_add_arg(_s("/O1"), cmdLine));
+#else
+		_check(_cmdline_add_arg(_s("-Os"), cmdLine));
+#endif
 	}
 
 	if(_g_config != Debug) {
@@ -1789,6 +2148,19 @@ static int _build_compiler_cmdline(const _source* source, str objFilePath, _cmdl
 
 	if(source->kind != RcSrc) /* TODO: Separate include paths and defines and pass them to rc */
 		_check(_cmdline_add_compile_options(source, &_g_compileOptions, &source->target->compileOpt, cmdLine));
+
+	/* Have the compiler list the included files for the dependency file */
+	if(_source_has_depfile(source)) {
+#ifdef COMPILER_MSVC
+		_check(_cmdline_add_arg(_s("/showIncludes"), cmdLine));
+#else
+		pathBuffer.len = 0;
+		_check(_make_depfile_path(source, &pathBuffer));
+		_check(_cmdline_add_arg(_s("-MD"), cmdLine));
+		_check(_cmdline_add_arg(_s("-MF"), cmdLine));
+		_check(_cmdline_add_arg(_str(pathBuffer.data, pathBuffer.len), cmdLine));
+#endif
+	}
 
 #ifdef COMPILER_MSVC
 	_check(_cmdline_add_arg(_s("/Fo"), cmdLine));
@@ -1999,6 +2371,23 @@ static int _add_flags_callback(str flag, void* userData, int line, const char* f
 		_check(_parse_list(flag_list, _add_flags_callback, &_target->compileOpt._cppFlags, __LINE__, __FILE__)); \
 	} while((void)0,0)
 
+/*
+ * Appends a path from a project file to a command line as the rest of the current argument. Relative paths are
+ * relative to the project file's directory. The path is assembled first so it is quoted as a whole, if at all.
+ */
+static int _cmdline_append_project_path(str path, _cmdlinebuffer* cmdLine) {
+	_pathbuffer pathBuffer;
+
+	pathBuffer.len = 0;
+
+	if(!_path_is_abs(path))
+		_check(_path_add_project_dir(_g_currentProjectDir, &pathBuffer));
+
+	_check(_path_append_raw(path, &pathBuffer));
+
+	return _cmdline_append_arg(_str(pathBuffer.data, pathBuffer.len), cmdLine);
+}
+
 static int _add_include_paths_callback(str includePath, void* userData, int line, const char* file) {
 	_cmdlinebuffer* cmdLine = (_cmdlinebuffer*)userData;
 	(void)line;
@@ -2010,17 +2399,7 @@ static int _add_include_paths_callback(str includePath, void* userData, int line
 	_check(_cmdline_add_arg(_s("-I"), cmdLine));
 #endif
 
-	if(!_path_is_abs(includePath)) {
-		if(!_path_is_abs(_g_currentProjectDir))
-			_check(_cmdline_append_arg(_g_cwd, cmdLine));
-
-		_check(_cmdline_append_arg(_g_currentProjectDir, cmdLine));
-		_check(_cmdline_append_arg(includePath, cmdLine));
-	} else {
-		_check(_cmdline_append_arg(includePath, cmdLine));
-	}
-
-	return 0;
+	return _cmdline_append_project_path(includePath, cmdLine);
 }
 
 #define include_paths(path_list) \
@@ -2092,26 +2471,13 @@ static int _add_defines_callback(str defineStr, void* userData, int line, const 
 	} while((void)0,0)
 
 static int _target_lib_path(str libPath, _cmdlinebuffer* cmdLine) {
-	if(libPath.len >= 0) {
 #ifdef COMPILER_MSVC
-		_check(_cmdline_add_arg(_s("/LIBPATH:"), cmdLine));
+	_check(_cmdline_add_arg(_s("/LIBPATH:"), cmdLine));
 #else
-		_check(_cmdline_add_arg(_s("-L"), cmdLine));
+	_check(_cmdline_add_arg(_s("-L"), cmdLine));
 #endif
 
-		if(!_path_is_abs(libPath)) {
-			if(!_path_is_abs(_g_currentProjectDir))
-				_check(_cmdline_append_arg(_g_cwd, cmdLine));
-
-			_check(_cmdline_append_arg(_g_currentProjectDir, cmdLine));
-			_check(_cmdline_append_arg(_s("/"), cmdLine));
-			_check(_cmdline_append_arg(libPath, cmdLine));
-		} else {
-			_check(_cmdline_append_arg(libPath, cmdLine));
-		}
-	}
-
-	return 0;
+	return _cmdline_append_project_path(libPath, cmdLine);
 }
 
 static int _target_link_lib(str libName, _cmdlinebuffer* cmdLine) {
@@ -2160,6 +2526,17 @@ static _bool _target_depends_on(Target target, Target dependency) {
 	return false;
 }
 
+static _bool _link_dependencies_done(Target target) {
+	int i;
+
+	for(i = 0; i < target->_linkDependencyCount; ++i) {
+		if(target->_linkDependencies[i]->_linkState != Linked)
+			return false;
+	}
+
+	return true;
+}
+
 static int _target_link(Target target, Target linkedTarget, int line, const char* file) {
 	_pathbuffer targetLibDirBuffer;
 	int         i;
@@ -2183,7 +2560,6 @@ static int _target_link(Target target, Target linkedTarget, int line, const char
 	}
 
 	target->_linkDependencies[target->_linkDependencyCount++] = linkedTarget;
-	linkedTarget->_isLinkTarget = true;
 
 	targetLibDirBuffer.len = 0;
 	_check(_make_target_filepath(_cstr(linkedTarget->name), linkedTarget->type, &targetLibDirBuffer));
@@ -2273,87 +2649,241 @@ static int _add_lib_paths_callback(str libPath, void* userData, int line, const 
  */
 
 #ifdef OS_WINDOWS
-static _bool _job_output_has_diagnostics(void* outputHandle) {
-	static char buffer[0x10000];
-	_ulong      bytesRead = 0;
-
-	SetFilePointer(outputHandle, 0, NONE, 0); /* FILE_BEGIN */
-
-	if(!ReadFile(outputHandle, buffer, sizeof(buffer), &bytesRead, NONE))
-		return true;
-
+/*
+ * Whether a line of compiler or linker output is a diagnostic worth showing
+ */
+static _bool _line_is_diagnostic(str line) {
 #ifdef COMPILER_MSVC
-	/*
-	 * cl prints the source file name and link prints informational lines (import library, LTCG), so the output is never empty.
-	 * Warnings and errors always contain " warning " or " error ". Output that doesn't fit into the buffer is never only informational.
-	 */
-	return bytesRead == sizeof(buffer) ||
-	       _str_contains(_str(buffer, (int)bytesRead), _s(" warning ")) ||
-	       _str_contains(_str(buffer, (int)bytesRead), _s(" error "));
+	/* cl prints the source file name and link prints informational lines, so the output is never empty. Warnings and errors always contain " warning " or " error " */
+	return _str_contains(line, _s(" warning ")) || _str_contains(line, _s(" error "));
 #else
 	/* gcc, clang and their linkers print nothing on success */
-	return bytesRead > 0;
+	return line.len > 0;
 #endif
 }
+
+/*
+ * Whether a line of compiler output is one of cl's /showIncludes notes. *path receives the included file.
+ */
+static _bool _line_is_include_note(str line, str* path) {
+#ifdef COMPILER_MSVC
+	const str note = _s(MSVC_INCLUDE_NOTE);
+
+	if(!_str_prefix(line, note))
+		return false;
+
+	*path = _str_right(line, line.len - note.len);
+
+	while(path->len > 0 && path->data[0] == ' ') { /* Indented by nesting depth */
+		++path->data;
+		--path->len;
+	}
+
+	while(path->len > 0 && ascii_isspace(path->data[path->len - 1]))
+		--path->len;
+
+	return true;
+#else
+	(void)line;
+	(void)path;
+	return false;
 #endif
+}
 
-static void _log_job_output(int jobIdx, _bool logError) {
-#ifdef OS_WINDOWS
-	char   buffer[512];
-	_ulong bytesRead    = 0;
-	void*  outputHandle = _g_win32ProcessStdOut[jobIdx];
+/*
+ * Shows the output of a finished job if it failed or contains diagnostics. cl's include notes are left out of the
+ * output and, if a dependency file writer is given, written to the dependency file.
+ */
+static void _finish_job_output(void* outputHandle, _bool failed, _filewriter* depFile) {
+	_filereader reader;
+	char        line[1024];
+	_bool       hasDiagnostics = false;
+	_bool       isIncludeLine  = false;
+	_bool       atLineStart;
+	_bool       lineEnd;
+	int         lineLen;
+	int         pass;
 
-	if(outputHandle && (logError || _job_output_has_diagnostics(outputHandle))) {
-		if(logError)
-			_log_err(_emptyString, -1, NONE);
-		else
-			_log_msg(_emptyString, -1, NONE);
+	/* The first pass collects the dependencies and decides whether there is anything to show, the second shows it */
+	for(pass = 0; pass < 2; ++pass) {
+		if(pass == 1) {
+			if(!failed && !hasDiagnostics)
+				break;
+
+			if(failed)
+				_log_err(_emptyString, -1, NONE);
+			else
+				_log_msg(_emptyString, -1, NONE);
+		}
 
 		SetFilePointer(outputHandle, 0, NONE, 0); /* FILE_BEGIN. The file position is shared with the finished job */
+		_filereader_init(&reader, outputHandle);
+		atLineStart = true;
 
-		while(ReadFile(outputHandle, buffer, sizeof(buffer), &bytesRead, NONE) && bytesRead > 0)
-			_log_raw(_str(buffer, (int)bytesRead));
+		while((lineLen = _filereader_line(&reader, line, sizeof(line), &lineEnd)) >= 0) {
+			const str piece       = _str(line, lineLen);
+			str       includePath = _emptyString;
+
+			if(atLineStart)
+				isIncludeLine = _line_is_include_note(piece, &includePath);
+
+			if(isIncludeLine) {
+				if(pass == 0 && atLineStart && depFile != NONE) {
+					_filewriter_write(depFile, _s(" \\\n "));
+					_depfile_write_path(depFile, includePath);
+				}
+			} else if(pass == 0) {
+				if(_line_is_diagnostic(piece))
+					hasDiagnostics = true;
+			} else {
+				_log_raw(piece);
+
+				if(lineEnd)
+					_log_raw(_s("\n"));
+			}
+
+			atLineStart = lineEnd;
+		}
 	}
+}
+
+/*
+ * Output and dependency file of a finished compile job. gcc and clang write the dependency file themselves but may
+ * have left it incomplete when they failed, for cl it is assembled from the include notes in the output.
+ */
+static void _finish_compile_job(const _source* source, void* outputHandle, _bool failed) {
+	_pathbuffer pathBuffer;
+	str         depFilePath;
+
+	pathBuffer.len = 0;
+
+	if(_make_depfile_path(source, &pathBuffer) != 0) {
+		_finish_job_output(outputHandle, failed, NONE);
+		return;
+	}
+
+	depFilePath = _str(pathBuffer.data, pathBuffer.len);
+
+	if(failed) {
+		_delete_file(depFilePath);
+		_finish_job_output(outputHandle, true, NONE);
+		return;
+	}
+
+#ifdef COMPILER_MSVC
+	{
+		_filewriter depFile;
+
+		_filewriter_init(&depFile, _open_file(depFilePath, true));
+		_depfile_write_path(&depFile, _file_basename(depFilePath)); /* The object file */
+		_filewriter_write(&depFile, _s(":"));
+
+		_finish_job_output(outputHandle, false, &depFile);
+
+		_filewriter_write(&depFile, _s("\n"));
+		_filewriter_flush(&depFile);
+		_close_file(depFile.handle);
+
+		if(depFile.failed) {
+			_log_err(_s("Failed to write dependency file '"), -1, NONE);
+			_log_raw(depFilePath);
+			_log_raw(_s("'"));
+			_delete_file(depFilePath);
+		}
+	}
+#else
+	_finish_job_output(outputHandle, false, NONE);
 #endif
 }
 
+/*
+ * Handles the output of a finished job and closes its handles
+ */
+static void _close_job(int jobIdx, _bool failed) {
+	const _job* job = &_g_win32Jobs[jobIdx];
+
+	if(job->stdOut != NONE) { /* The relaunched build program writes to the console directly */
+		if(job->source != NONE && _source_has_depfile(job->source))
+			_finish_compile_job(job->source, job->stdOut, failed);
+		else
+			_finish_job_output(job->stdOut, failed, NONE);
+
+		CloseHandle(job->stdOut);
+	}
+
+	if(job->target != NONE)
+		job->target->_linkState = Linked;
+
+	CloseHandle(_g_win32Processes[jobIdx]);
+}
+
+#endif
+
+/*
+ * Waits for any running job to finish and removes it from the job list. Fails if no job is running.
+ */
+static int _wait_any_job(void) {
+#ifdef OS_WINDOWS
+	_ulong exitCode = 0;
+	_ulong wait;
+
+	log_flush(); /* Show the pending log line before blocking */
+
+	wait = WaitForMultipleObjects((_ulong)_g_win32ProcessCount, _g_win32Processes, 0, INFINITE);
+
+	if(wait == WAIT_FAILED) {
+		/* No way to tell which job the wait failed for, give up on all of them */
+		const int error = (int)GetLastError();
+		int       i;
+
+		for(i = 0; i < _g_win32ProcessCount; ++i)
+			_close_job(i, true);
+
+		mem_fill(_g_win32Processes, 0, sizeof(_g_win32Processes));
+		mem_fill(_g_win32Jobs, 0, sizeof(_g_win32Jobs));
+		_g_win32ProcessCount = 0;
+
+		return error;
+	}
+
+	GetExitCodeProcess(_g_win32Processes[wait], &exitCode);
+	_close_job((int)wait, exitCode != 0);
+
+	--_g_win32ProcessCount;
+	_g_win32Processes[wait]                 = _g_win32Processes[_g_win32ProcessCount];
+	_g_win32Jobs[wait]                      = _g_win32Jobs[_g_win32ProcessCount];
+	_g_win32Processes[_g_win32ProcessCount] = NONE;
+	mem_fill(&_g_win32Jobs[_g_win32ProcessCount], 0, sizeof(_job));
+
+	return (int)exitCode;
+#else
+	return 1;
+#endif
+}
+
+/*
+ * Waits for all running jobs to finish. Returns the exit code of the last job that failed.
+ */
 static int _wait_jobs(void) {
 	int exitCode = 0;
 
 #ifdef OS_WINDOWS
-	int i;
+	while(_g_win32ProcessCount > 0) {
+		const int jobExit = _wait_any_job();
 
-	log_flush(); /* Show the pending log line before blocking */
-
-	for(i = 0; i < _g_win32ProcessCount; ++i) {
-		void*  hProcess = _g_win32Processes[i];
-		_ulong wait     = WaitForSingleObject(hProcess, INFINITE);
-
-		if(wait == WAIT_FAILED) {
-			exitCode = (int)GetLastError();
-		} else {
-			_ulong procExit = 0;
-			GetExitCodeProcess(hProcess, &procExit);
-
-			if(procExit != 0)
-				exitCode = (int)procExit;
-
-			_log_job_output(i, procExit != 0);
-		}
-
-		CloseHandle(_g_win32ProcessStdOut[i]);
-		CloseHandle(hProcess);
+		if(jobExit != 0)
+			exitCode = jobExit;
 	}
-
-	mem_fill(_g_win32Processes, 0, sizeof(_g_win32Processes));
-	mem_fill(_g_win32ProcessStdOut, 0, sizeof(_g_win32ProcessStdOut));
-	_g_win32ProcessCount = 0;
+#endif
 
 	return exitCode;
-#endif
 }
 
-static int _add_job(const _cmdlinebuffer* cmdLine, str workingDir, _bool redirectOutput) {
+/*
+ * Starts a process. source is the source of a compile job (for its dependency file and output), target the target of a
+ * link job (marked done when the job finishes), NONE for other jobs.
+ */
+static int _add_job(const _cmdlinebuffer* cmdLine, str workingDir, _bool redirectOutput, const _source* source, Target target) {
 #ifdef OS_WINDOWS
 	_wchar              workingDirBuffer[MAX_PATH];
 	_wchar              cmdLineBuffer[MAX_COMMAND_LINE + 1];
@@ -2375,28 +2905,8 @@ static int _add_job(const _cmdlinebuffer* cmdLine, str workingDir, _bool redirec
 	mem_fill(&securityAttributes, 0, sizeof(securityAttributes));
 
 	/* Max job slots used, wait for one to finish */
-	if(_g_win32ProcessCount >= _g_maxJobs) {
-		_ulong       exitCode = 0;
-		const _ulong wait     = WaitForMultipleObjects((_ulong)_g_win32ProcessCount, _g_win32Processes, 0, INFINITE);
-
-		if(wait == WAIT_FAILED)
-			return (int)GetLastError();
-
-		GetExitCodeProcess(_g_win32Processes[wait], &exitCode);
-
-		_log_job_output((int)wait, exitCode != 0);
-
-		CloseHandle(_g_win32Processes[wait]);
-		CloseHandle(_g_win32ProcessStdOut[wait]);
-		--_g_win32ProcessCount;
-		_g_win32Processes[wait]                     = _g_win32Processes[_g_win32ProcessCount];
-		_g_win32ProcessStdOut[wait]                 = _g_win32ProcessStdOut[_g_win32ProcessCount];
-		_g_win32Processes[_g_win32ProcessCount]     = NONE;
-		_g_win32ProcessStdOut[_g_win32ProcessCount] = NONE;
-
-		if(exitCode != 0)
-			return (int)exitCode;
-	}
+	if(_g_win32ProcessCount >= _g_maxJobs)
+		_check(_wait_any_job());
 
 	securityAttributes.nLength        = sizeof(SECURITY_ATTRIBUTES);
 	securityAttributes.bInheritHandle = 1;
@@ -2445,22 +2955,17 @@ static int _add_job(const _cmdlinebuffer* cmdLine, str workingDir, _bool redirec
 
 	CloseHandle(processInfo.hThread);
 
-	_g_win32Processes[_g_win32ProcessCount]     = processInfo.hProcess;
-	_g_win32ProcessStdOut[_g_win32ProcessCount] = outputFile;
+	_g_win32Processes[_g_win32ProcessCount]   = processInfo.hProcess;
+	_g_win32Jobs[_g_win32ProcessCount].stdOut = outputFile;
+	_g_win32Jobs[_g_win32ProcessCount].source = source;
+	_g_win32Jobs[_g_win32ProcessCount].target = target;
 	++_g_win32ProcessCount;
+#else
+	(void)source;
+	(void)target;
 #endif
 
 	return 0;
-}
-
-static _bool _filetime_is_newer(_filetime f1, _filetime f2) {
-	if(f1.hi > f2.hi)
-		return true;
-
-	if(f1.hi == f2.hi)
-		return f1.lo > f2.lo;
-
-	return false;
 }
 
 static int _add_compile_job(_source* source) {
@@ -2475,22 +2980,22 @@ static int _add_compile_job(_source* source) {
 
 	_get_lastmodified(objFilePath, &objLastModified);
 
-	if(_g_incremental && _filetime_is_newer(objLastModified, source->lastModified))
+	if(_g_incremental && _source_up_to_date(source, objLastModified, false))
 		return 0;
 
 	_check(_build_compiler_cmdline(source, objFilePath, &cmdLine));
-
-	if(_g_verbose)
-		_log_cmdline(&cmdLine);
 
 	_log_msg(_s("["), -1, NONE);
 	_log_raw(_cstr(source->target->name));
 	_log_raw(_s("] "));
 	_log_raw(_file_without_path(source->fileName));
 
+	if(_g_verbose)
+		_log_cmdline(&cmdLine);
+
 	_check(_create_directory(_path_without_file(objFilePath), -1, NONE));
 
-	return _add_job(&cmdLine, source->target->projectDir, true);
+	return _add_job(&cmdLine, source->target->projectDir, true, source, NONE);
 }
 
 static int _add_link_job(Target target) {
@@ -2528,8 +3033,10 @@ static int _add_link_job(Target target) {
 		}
 	}
 
-	if(!target->_needsLink)
+	if(!target->_needsLink) {
+		target->_linkState = Linked;
 		return 0;
+	}
 
 	_check(_build_linker_cmdline(target, &cmdLine));
 
@@ -2542,9 +3049,6 @@ static int _add_link_job(Target target) {
 	}
 #endif
 
-	if(_g_verbose)
-		_log_cmdline(&cmdLine);
-
 	if(target->type == StaticLibrary)
 		_log_msg(_s("Creating "), -1, NONE);
 	else
@@ -2553,7 +3057,12 @@ static int _add_link_job(Target target) {
 	_log_raw(_cstr(target->name));
 	_log_raw(_artifact_file_ext(target->type));
 
-	return _add_job(&cmdLine, target->projectDir, true);
+	if(_g_verbose)
+		_log_cmdline(&cmdLine);
+
+	target->_linkState = Linking;
+
+	return _add_job(&cmdLine, target->projectDir, true, NONE, target);
 }
 
 /*
@@ -2562,27 +3071,6 @@ static int _add_link_job(Target target) {
 
 static _buildconfig config(void) {
 	return _g_config;
-}
-
-static void _sort_targets_by_link_order(Target* targets, int count) {
-	int j;
-
-	for(j = 1; j < count; ++j) {
-		_bool swapped = false;
-		int   i;
-
-		for(i = 0; i < count - j; ++i) {
-			if(_target_depends_on(targets[i], targets[i + 1])) {
-				Target tmp = targets[i];
-				targets[i]     = targets[i + 1];
-				targets[i + 1] = tmp;
-				swapped        = true;
-			}
-		}
-
-		if(!swapped)
-			break;
-	}
 }
 
 static int _install(void) {
@@ -2619,12 +3107,8 @@ static int _install(void) {
 		installPathBuffer.len = 0;
 
 		/* Relative install directories are relative to the project file that set them */
-		if(!_path_is_abs(installDir)) {
-			if(!_path_is_abs(installDirBase))
-				_check(_path_add_segment(_g_cwd, &installPathBuffer));
-
-			_check(_path_add_segment(installDirBase, &installPathBuffer));
-		}
+		if(!_path_is_abs(installDir))
+			_check(_path_add_project_dir(installDirBase, &installPathBuffer));
 
 		_check(_path_add_segment(installDir, &installPathBuffer));
 
@@ -2700,50 +3184,61 @@ static int _build(void) {
 	if(exitCode != 0)
 		return exitCode;
 
-	/* TODO: Move compilation and link steps into separate functions */
-	{
-		Target    targets[MAX_TARGETS];
-		const int targetCount = _g_targetCount;
+	/*
+	 * Link. A target is linked as soon as every target it links against is done, so targets which don't depend on each
+	 * other link in parallel. Skipped targets count as done; their artifacts are expected to exist.
+	 */
+	for(i = 0; i < _g_targetCount; ++i)
+		_g_targets[i]._linkState = _g_targets[i]._skipBuild ? Linked : NotLinked;
 
-		for(i = 0; i < targetCount; ++i)
-			targets[i] = &_g_targets[i];
+	for(;;) {
+		_bool started = false;
+		_bool pending = false;
 
-		_sort_targets_by_link_order(targets, targetCount);
+		for(i = 0; i < _g_targetCount; ++i) {
+			Target target = &_g_targets[i];
 
-		for(i = 0; i < targetCount; ++i) {
-			Target target = targets[i];
+			if(target->_linkState == Linked)
+				continue;
 
-			if(target->_skipBuild)
+			pending = true;
+
+			if(target->_linkState == Linking || !_link_dependencies_done(target))
 				continue;
 
 			exitCode = _add_link_job(target);
 
 			if(exitCode != 0) {
 				_wait_jobs();
-				break;
+				return exitCode;
 			}
 
-			if(target->_isLinkTarget)
-				_check(_wait_jobs()); /* Can't link targets which are linked against by others in parallel */
+			started = true;
 		}
 
-		if(exitCode == 0)
-			exitCode = _wait_jobs();
+		if(!pending)
+			break;
+
+		if(!started) /* Otherwise a target which didn't need linking may have unblocked one scanned before it */
+			_check(_wait_any_job());
 	}
 
-	if(_g_install && exitCode == 0)
+	if(_g_install)
 		_check(_install());
 
-	return exitCode;
+	return 0;
 }
 
 static int _rebuild_if_needed(const char* srcFile, int argc, char** argv, _bool* didRebuild) {
-	char        targetNameBuffer[64];
-	Target      target;
-	_source*    source;
-	str         targetName = _file_without_path(_file_basename(_cstr(srcFile)));
+	static _pathbuffer tmpBuildDirBuffer;
+	const str          prevBuildDir = _g_buildDir;
+	const _buildconfig prevConfig   = _g_config;
+	char               targetNameBuffer[64];
+	Target             target;
+	_source*           source;
+	str                targetName = _file_without_path(_file_basename(_cstr(srcFile)));
 #ifdef OS_WINDOWS
-	_wchar      wExePathBuffer[MAX_PATH];
+	_wchar             wExePathBuffer[MAX_PATH];
 #endif
 
 	if(targetName.len >= (int)sizeof(targetNameBuffer) - 1) {
@@ -2754,10 +3249,16 @@ static int _rebuild_if_needed(const char* srcFile, int argc, char** argv, _bool*
 	mem_copy(targetNameBuffer, targetName.data, targetName.len);
 	targetNameBuffer[targetName.len] = '\0';
 
-	_check(_add_target(targetNameBuffer, Executable, srcFile, -1, NONE));
+	target = _add_target(targetNameBuffer, Executable, -1, NONE);
+
+	if(!target)
+		return 1;
+
+	target_sources(target, NONE, srcFile);
 
 	target = &_g_targets[_g_targetCount - 1];
 	source = &_g_sources[_g_sourceCount - 1];
+	target->compileOpt.optimizations = OptimizeSpeed;
 
 	/*
 	 * Get lastmodified timestamp from actual executable file which might not be the same as the target.
@@ -2772,29 +3273,27 @@ static int _rebuild_if_needed(const char* srcFile, int argc, char** argv, _bool*
 	_win32_get_lastmodified(wExePathBuffer, &target->_lastModified);
 #endif
 
-	if(_filetime_is_newer(source->lastModified, target->_lastModified)) {
+	/*
+	 * The build program is rebuilt in the release config into _g_buildDir + ".tmp", where the dependency file of its
+	 * last rebuild is as well
+	 */
+	tmpBuildDirBuffer.len = 0;
+	_check(_path_add_segment(_g_buildDir, &tmpBuildDirBuffer));
+	_check(_path_add_segment(_s(".tmp"), &tmpBuildDirBuffer));
+	_g_buildDir = _str(tmpBuildDirBuffer.data, tmpBuildDirBuffer.len);
+	_g_config   = Release;
+
+	if(!_source_up_to_date(source, target->_lastModified, false)) {
 #ifdef OS_WINDOWS
-		static _pathbuffer buildDirBuffer;
-		_pathbuffer        pathBuffer;
-		_wchar             wTmpExePathBuffer[MAX_PATH];
-		str                artifactPath;
+		_pathbuffer pathBuffer;
+		_wchar      wTmpExePathBuffer[MAX_PATH];
+		str         artifactPath;
 
 		_g_incremental       = false;
 		_g_targetsToBuild[0] = targetNameBuffer;
 		_g_targetsToBuild[1] = NONE;
-
-		_g_config     = Release;
-		_g_installDir = _emptyString; /* Don't install */
+		_g_installDir        = _emptyString; /* Don't install */
 		_log_msg(_s("Recreating build program because the source has changed"), -1, NONE);
-
-		/*
-		 * Set build directory to _g_buildDir + ".tmp"
-		 */
-
-		buildDirBuffer.len = 0;
-		_check(_path_add_segment(_g_buildDir, &buildDirBuffer));
-		_check(_path_add_segment(_s(".tmp"), &buildDirBuffer));
-		_g_buildDir = _str(buildDirBuffer.data, buildDirBuffer.len);
 
 		_check(_create_directory(_g_buildDir, -1, NONE));
 
@@ -2853,10 +3352,12 @@ static int _rebuild_if_needed(const char* srcFile, int argc, char** argv, _bool*
 			}
 
 			_log_raw(_s("\n"));
-			_check(_add_job(&cmdLine, _g_cwd, false));
+			_check(_add_job(&cmdLine, _g_cwd, false, NONE, NONE));
 			_check(_wait_jobs());
 		}
 	} else {
+		_g_buildDir = prevBuildDir;
+		_g_config   = prevConfig;
 		*didRebuild = false;
 	}
 
@@ -2907,7 +3408,7 @@ static int _rebuild_if_needed(const char* srcFile, int argc, char** argv, _bool*
 static int _init(void) {
 #ifdef OS_WINDOWS
 	typedef _wchar**(_winapi*CmdLineToArgv)(const _wchar*, int*);
-	void*         shell32            = LoadLibraryW(L"Shell32.dll");
+	void*         shell32            = LoadLibraryA("Shell32.dll");
 	CmdLineToArgv CommandLineToArgvW = (CmdLineToArgv)GetProcAddress(shell32, "CommandLineToArgvW");
 	_wchar**      argvW              = CommandLineToArgvW(GetCommandLineW(), &_g_win32Argc);
 	int           bufferOffset       = 0;

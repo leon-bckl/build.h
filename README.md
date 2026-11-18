@@ -18,7 +18,8 @@ Here's a simple project called 'Test' which builds an executable called 'MyProgr
 #include "build.h"
 
 begin_project(Test)
-	executable("MyProgram", "main.c");
+	Target myProgram = executable("MyProgram");
+	target_sources(myProgram, NONE, "main.c");
 end_project
 ```
 
@@ -38,31 +39,31 @@ The following arguments can be used when calling the compiled build system execu
 - `-b<dirname>` specifies the build directory where the artifacts are created. By default it is `./.build`. Each config gets its own subdirectory (`dbg`, `rel`, `prf`), so artifacts of different configs never mix:
   - `<build dir>/<config>/<target>.<ext>` for binaries, import libraries and linker pdbs
   - `<build dir>/<config>/obj/<target>/<source path>.obj` for object files, where the source path is relative to the target's project directory. `..` segments become `__`, so object files always stay inside the build directory.
-- `--incremental` only compiles the source files that have changed by looking at their last-modified timestamp and comparing it against the compiled object file. This does not consider changes in included headers yet.
+- `--incremental` only compiles the source files that have changed by looking at their last-modified timestamp and comparing it against the compiled object file. Changes in headers are also tracked.
 - `<target>` (without `-`) only builds the target with that name and its dependencies. Multiple targets can be specified.
 
 ## Targets
 
 A target corresponds with an output binary like an executable or library. The target name defines the name of the binary file. Target names must be unique for the entire project and are case-insensitive.
 
-Targets are created using `executable`, `shared_library` and `static_library`. The first parameter is always the target name, followed by a list of source files which can also be `NONE` and then specified later using `target_sources`.
+Targets are created using `executable`, `shared_library` and `static_library`. The only parameter is the target name. Source files are added using `target_sources`.
 
 The commands that work with targets all have the form `target_*` and take a target or target name as the first parameter. Most of these commands have a non-target specific variant that applies to all targets like for example `target_include_paths` and `include_paths` or `target_defines` and `defines`.
 
 ```cpp
-executable("MyProgram", "main.c");
+executable("MyProgram");
 target_defines("MyProgram", "FOO=1");
 
 /* Or alternatively using a target value instead of the name */
 
-Target myProgram = executable("MyProgram", "main.c");
+Target myProgram = executable("MyProgram");
 target_defines(myProgram, "FOO=1");
 ```
 
 Source paths are relative to the project directory (see `project_directory`). `target_sources` takes the directory of its sources as the second parameter (or `NONE`), so it doesn't have to be repeated for every file:
 
 ```cpp
-Target core = shared_library("Core", NONE);
+Target core = shared_library("Core");
 target_sources(core, "src", "main.c util.c");
 target_sources(core, "src/zlib", "inflate.c deflate.c");
 ```
