@@ -3617,6 +3617,9 @@ int main(int argc, char** argv) {
 				_log_raw(_s("unknown"));
 			}
 
+			_log_msg(_s("Build dir: "), -1, NONE);
+			_log_raw(_g_buildDir);
+
 			exitCode = _main(argc, argv);
 		}
 	}
