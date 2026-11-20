@@ -3248,7 +3248,9 @@ static int _rebuild_if_needed(const char* srcFile, int argc, char** argv, _bool*
 	char               targetNameBuffer[64];
 	Target             target;
 	_source*           source;
-	str                targetName = _file_without_path(_file_basename(_cstr(srcFile)));
+	char               quotedSrcFileBuffer[MAX_PATH + 3];
+	const str          srcFileStr = _cstr(srcFile);
+	str                targetName = _file_without_path(_file_basename(srcFileStr));
 #ifdef OS_WINDOWS
 	_wchar             wExePathBuffer[MAX_PATH];
 #endif
@@ -3266,9 +3268,21 @@ static int _rebuild_if_needed(const char* srcFile, int argc, char** argv, _bool*
 	if(!target)
 		return 1;
 
-	target_sources(target, NONE, srcFile);
+	/*
+	 * target_sources parses its argument as a list, so the path is quoted to keep it in one piece if it contains spaces.
+	 * __FILE__ is whatever path the compiler was given, e.g. an absolute one when the build program rebuilt itself.
+	 */
+	if(srcFileStr.len + 2 >= (int)sizeof(quotedSrcFileBuffer)) {
+		_log_err(_s("Build project file path too long"), -1, NONE);
+		return 1;
+	}
 
-	target = &_g_targets[_g_targetCount - 1];
+	quotedSrcFileBuffer[0] = '"';
+	mem_copy(quotedSrcFileBuffer + 1, srcFileStr.data, srcFileStr.len);
+	quotedSrcFileBuffer[srcFileStr.len + 1] = '"';
+	quotedSrcFileBuffer[srcFileStr.len + 2] = '\0';
+	_check(_target_sources(target, NONE, quotedSrcFileBuffer, -1, NONE));
+
 	source = &_g_sources[_g_sourceCount - 1];
 	target->compileOpt.optimizations = OptimizeSpeed;
 
