@@ -284,6 +284,7 @@ static _bool           _g_verbose     = false;
 static _bool           _g_incremental = false;
 static _bool           _g_install     = false;
 static int             _g_maxJobs     = 1;
+static int             _g_jobError    = 0; /* Exit code of the last job that failed, 0 while none has */
 
 static char            _g_cwdBuffer[MAX_PATH];
 static str             _g_cwd;
@@ -2820,7 +2821,8 @@ static void _close_job(int jobIdx, _bool failed) {
 #endif
 
 /*
- * Waits for any running job to finish and removes it from the job list. Fails if no job is running.
+ * Waits for any running job to finish and removes it from the job list. Fails if no job is running or the wait itself
+ * failed. A job that finished with an error is not a failure here, its exit code is recorded in _g_jobError.
  */
 static int _wait_any_job(void) {
 #ifdef OS_WINDOWS
@@ -2849,34 +2851,32 @@ static int _wait_any_job(void) {
 	GetExitCodeProcess(_g_win32Processes[wait], &exitCode);
 	_close_job((int)wait, exitCode != 0);
 
+	if(exitCode != 0)
+		_g_jobError = (int)exitCode;
+
 	--_g_win32ProcessCount;
 	_g_win32Processes[wait]                 = _g_win32Processes[_g_win32ProcessCount];
 	_g_win32Jobs[wait]                      = _g_win32Jobs[_g_win32ProcessCount];
 	_g_win32Processes[_g_win32ProcessCount] = NONE;
 	mem_fill(&_g_win32Jobs[_g_win32ProcessCount], 0, sizeof(_job));
 
-	return (int)exitCode;
+	return 0;
 #else
 	return 1;
 #endif
 }
 
 /*
- * Waits for all running jobs to finish. Returns the exit code of the last job that failed.
+ * Waits for all running jobs to finish. Like _wait_any_job this only fails if the wait itself failed, whether a job
+ * failed is in _g_jobError.
  */
 static int _wait_jobs(void) {
-	int exitCode = 0;
-
 #ifdef OS_WINDOWS
-	while(_g_win32ProcessCount > 0) {
-		const int jobExit = _wait_any_job();
-
-		if(jobExit != 0)
-			exitCode = jobExit;
-	}
+	while(_g_win32ProcessCount > 0)
+		_check(_wait_any_job());
 #endif
 
-	return exitCode;
+	return 0;
 }
 
 /*
@@ -3137,6 +3137,8 @@ static int _build(void) {
 	int exitCode = 0;
 	int i;
 
+	_g_jobError = 0;
+
 	if(_g_targetsToBuild[0] != NONE) {
 		const char** nameIt;
 
@@ -3170,23 +3172,25 @@ static int _build(void) {
 		if(source->compiled || source->target->_skipBuild)
 			continue;
 
+		/* A compile error doesn't stop the stage so all errors show up in one go. Not being able to start a job does. */
 		exitCode = _add_compile_job(source);
 
 		if(exitCode != 0) {
 			_wait_jobs();
-			break;
+			return exitCode;
 		}
 	}
 
-	if(exitCode == 0)
-		exitCode = _wait_jobs();
+	_check(_wait_jobs());
 
-	if(exitCode != 0)
-		return exitCode;
+	/* Nothing links against objects that failed to compile */
+	if(_g_jobError != 0)
+		return _g_jobError;
 
 	/*
 	 * Link. A target is linked as soon as every target it links against is done, so targets which don't depend on each
 	 * other link in parallel. Skipped targets count as done; their artifacts are expected to exist.
+	 * Unlike a compile error a failed link ends the stage, the targets linking against the failed one would fail too.
 	 */
 	for(i = 0; i < _g_targetCount; ++i)
 		_g_targets[i]._linkState = _g_targets[i]._skipBuild ? Linked : NotLinked;
@@ -3206,6 +3210,9 @@ static int _build(void) {
 			if(target->_linkState == Linking || !_link_dependencies_done(target))
 				continue;
 
+			if(_g_jobError != 0)
+				break;
+
 			exitCode = _add_link_job(target);
 
 			if(exitCode != 0) {
@@ -3216,12 +3223,17 @@ static int _build(void) {
 			started = true;
 		}
 
-		if(!pending)
+		if(!pending || _g_jobError != 0)
 			break;
 
 		if(!started) /* Otherwise a target which didn't need linking may have unblocked one scanned before it */
 			_check(_wait_any_job());
 	}
+
+	_check(_wait_jobs()); /* The jobs still running after a failed link */
+
+	if(_g_jobError != 0)
+		return _g_jobError;
 
 	if(_g_install)
 		_check(_install());
@@ -3354,6 +3366,9 @@ static int _rebuild_if_needed(const char* srcFile, int argc, char** argv, _bool*
 			_log_raw(_s("\n"));
 			_check(_add_job(&cmdLine, _g_cwd, false, NONE, NONE));
 			_check(_wait_jobs());
+
+			if(_g_jobError != 0) /* The relaunched build failed, its output already went to the console */
+				return _g_jobError;
 		}
 	} else {
 		_g_buildDir = prevBuildDir;
